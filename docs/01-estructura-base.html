@@ -1,0 +1,738 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>Sistema de Tareas Inteligente — Microservicios con FastAPI</title>
+
+<meta name="description" content="Dos microservicios FastAPI independientes que se hablan por HTTP síncrono, con autenticación por tokens opacos y dos bases de datos.">
+<meta name="robots" content="index, follow, max-snippet:-1">
+<meta name="theme-color" content="#0d1117">
+
+<meta property="og:type" content="article">
+<meta property="og:locale" content="es_ES">
+<meta property="og:title" content="Sistema de Tareas Inteligente — Microservicios con FastAPI">
+<meta property="og:description" content="Dos microservicios FastAPI independientes que se hablan por HTTP síncrono, con autenticación por tokens opacos y dos bases de datos.">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Sistema de Tareas Inteligente — Microservicios con FastAPI">
+
+<style>
+  :root{
+    --bg:#0b0e14; --panel:#141922; --panel-2:#1b212c; --line:#262d3a;
+    --text:#e8eef6; --muted:#8892a4; --dim:#5d6675;
+    --accent:#58a6ff; --users:#3fb950; --tasks:#d29922;
+    --ok:#3fb950; --warn:#d29922; --err:#f85149; --purple:#bc8cff;
+    --mono:'SF Mono',ui-monospace,'JetBrains Mono',Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{
+    background:var(--bg); color:var(--text);
+    font:17px/1.65 -apple-system,BlinkMacSystemFont,'Segoe UI',Inter,Roboto,sans-serif;
+    overflow:hidden;
+  }
+
+  /* ---------- Deck ---------- */
+  .deck{position:relative;height:100vh;width:100vw}
+  .slide{
+    position:absolute;inset:0;
+    display:none;
+    flex-direction:column;justify-content:center;
+    padding:5vh 7vw;
+    opacity:0;transform:translateY(12px);
+    transition:opacity .28s ease, transform .28s ease;
+  }
+  .slide.active{display:flex;opacity:1;transform:none}
+  .slide.wide{justify-content:flex-start;padding-top:7vh}
+
+  /* ---------- Tipografía ---------- */
+  h1{font-size:clamp(2.2rem,5.2vw,4rem);line-height:1.08;margin:0 0 18px;letter-spacing:-.03em}
+  h2{font-size:clamp(1.5rem,3vw,2.3rem);line-height:1.15;margin:0 0 6px;letter-spacing:-.02em}
+  h3{font-size:1.05rem;margin:0 0 12px;color:var(--accent);letter-spacing:-.01em}
+  .kicker{font:700 12px/1 var(--mono);letter-spacing:.18em;text-transform:uppercase;
+          color:var(--accent);margin-bottom:18px}
+  .lead{font-size:clamp(1.05rem,1.6vw,1.3rem);color:var(--muted);max-width:60ch;margin:0}
+  p{margin:12px 0}
+  strong{color:#fff}
+  code{font-family:var(--mono);font-size:.88em;background:var(--panel-2);
+       padding:2px 7px;border-radius:5px;border:1px solid var(--line)}
+  pre{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+      padding:18px 20px;overflow:auto;margin:18px 0}
+  pre code{background:none;border:none;padding:0;font-size:.84rem;line-height:1.6;display:block}
+  .c-k{color:#ff7b72}.c-f{color:#d2a8ff}.c-s{color:#a5d6ff}
+  .c-c{color:#6e7681;font-style:italic}.c-v{color:#ffa657}.c-n{color:#79c0ff}
+  ul,ol{margin:12px 0;padding-left:22px}
+  li{margin:7px 0}
+  .small{font-size:.86rem;color:var(--muted)}
+
+  /* ---------- Cajas ---------- */
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px 24px}
+  .grid{display:grid;gap:18px;margin:22px 0}
+  .g2{grid-template-columns:repeat(2,1fr)}
+  .g3{grid-template-columns:repeat(3,1fr)}
+  .note{border-left:3px solid var(--accent);background:var(--panel);
+        padding:14px 18px;border-radius:0 10px 10px 0;margin:18px 0;color:var(--muted);font-size:.96rem}
+  .note.warn{border-left-color:var(--warn)}
+  .note.err{border-left-color:var(--err)}
+  .note.ok{border-left-color:var(--ok)}
+  .note b,.note strong{color:var(--text)}
+
+  .pill{display:inline-block;font:600 12px/1 var(--mono);padding:6px 11px;border-radius:999px;
+        border:1px solid var(--line);color:var(--muted);background:var(--panel);margin:0 6px 6px 0}
+  .pill.a{border-color:var(--accent);color:var(--accent)}
+  .pill.u{border-color:var(--users);color:var(--users)}
+  .pill.t{border-color:var(--tasks);color:var(--tasks)}
+
+  /* ---------- Métricas ---------- */
+  .metric{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px}
+  .metric .n{font:700 2.3rem/1 var(--mono);letter-spacing:-.03em}
+  .metric .l{font-size:.82rem;color:var(--muted);margin-top:9px;line-height:1.45}
+  .m-ok .n{color:var(--ok)} .m-err .n{color:var(--err)}
+  .m-warn .n{color:var(--warn)} .m-acc .n{color:var(--accent)}
+  .m-dim .n{color:var(--muted)}
+
+  /* ---------- Diagrama ---------- */
+  .dia{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:30px 26px;margin:22px 0}
+  .drow{display:flex;align-items:center;justify-content:center}
+  .dnode{border:1.5px solid var(--line);border-radius:12px;padding:14px 16px;background:var(--panel-2);
+         text-align:center;min-width:170px}
+  .dnode .lab{font:700 9px/1 var(--mono);letter-spacing:.14em;color:var(--dim);text-transform:uppercase;margin-bottom:7px}
+  .dnode .nm{font-weight:600;font-size:.95rem;margin-bottom:3px}
+  .dnode .mt{font:500 10px/1.5 var(--mono);color:var(--muted)}
+  .dnode.users{border-color:var(--users)} .dnode.users .nm{color:var(--users)}
+  .dnode.tasks{border-color:var(--tasks)} .dnode.tasks .nm{color:var(--tasks)}
+  .dnode.cli{border-color:#4a5568}
+  .dlink{flex:1;min-width:90px;position:relative;text-align:center;padding:0 8px}
+  .dlink .bar{height:2px;background:var(--line);position:relative}
+  .dlink .cap{font:700 9px/1.4 var(--mono);color:var(--muted);padding-bottom:7px;letter-spacing:.04em}
+  .dlink .cap b{display:block;color:var(--text);font-size:10px}
+  .dlink.r .bar::after{content:'';position:absolute;right:-1px;top:-4px;
+    border-left:8px solid var(--line);border-top:5px solid transparent;border-bottom:5px solid transparent}
+  .dlink.l .bar::after{content:'';position:absolute;left:-1px;top:-4px;
+    border-right:8px solid var(--line);border-top:5px solid transparent;border-bottom:5px solid transparent}
+  .st{font:700 9px/1 var(--mono);padding:4px 7px;border-radius:4px;display:inline-block;margin-top:6px}
+  .st-2{background:rgba(63,185,80,.14);color:var(--ok)}
+  .st-4{background:rgba(248,81,73,.14);color:var(--err)}
+  .st-5{background:rgba(210,153,34,.14);color:var(--warn)}
+
+  /* ---------- Tabla ---------- */
+  table{width:100%;border-collapse:collapse;font-size:.88rem;margin:16px 0}
+  th,td{text-align:left;padding:9px 11px;border-bottom:1px solid var(--line)}
+  th{font:700 10px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--dim)}
+  tbody tr:last-child td{border-bottom:none}
+  .ok{color:var(--ok);font-weight:600} .bad{color:var(--err);font-weight:600} .mid{color:var(--warn);font-weight:600}
+
+  /* ---------- Chrome ---------- */
+  .bar{position:fixed;left:0;bottom:0;height:3px;background:var(--accent);z-index:30;transition:width .28s ease}
+  .hud{position:fixed;right:22px;bottom:18px;z-index:30;display:flex;align-items:center;gap:14px;
+       font:600 11px/1 var(--mono);color:var(--dim)}
+  .hud button{background:var(--panel);border:1px solid var(--line);color:var(--muted);
+              border-radius:7px;padding:7px 11px;font:600 11px/1 var(--mono);cursor:pointer}
+  .hud button:hover{border-color:var(--accent);color:var(--accent)}
+  .help{position:fixed;left:22px;bottom:18px;z-index:30;font:500 11px/1 var(--mono);color:var(--dim)}
+  .help kbd{background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:3px 6px;color:var(--muted)}
+  .foot{position:fixed;left:7vw;right:7vw;bottom:16px;z-index:20;font:500 10px/1.5 var(--mono);
+        color:var(--dim);opacity:0;transition:opacity .2s}
+  .slide.active ~ .foot{opacity:1}
+
+  /* ---------- Impresión / PDF ---------- */
+  @media print{
+    @page{size:A4 landscape;margin:0}
+    body{overflow:visible;background:#fff}
+    .deck{height:auto}
+    .slide{display:flex !important;position:relative;inset:auto;opacity:1 !important;transform:none !important;
+           page-break-after:always;break-after:page;height:100vh;max-height:none;
+           border-bottom:1px dashed #ccc}
+    .bar,.hud,.help,.foot{display:none !important}
+    .card,.dia,pre,.metric{break-inside:avoid}
+  }
+</style>
+</head>
+<body>
+
+<main class="deck">
+
+<!-- ============ 1 · PORTADA ============ -->
+<section class="slide active">
+  <div class="kicker">FastAPI · Python 3.14 · uv · dos servicios · dos bases de datos</div>
+  <h1>Sistema de Tareas<br>Inteligente</h1>
+  <p class="lead">Dos microservicios FastAPI independientes que se hablan por HTTP síncrono,
+     con autenticación delegada y sin compartir una sola base de datos.</p>
+  <div style="margin-top:34px">
+    <span class="pill u">user-service :8000</span>
+    <span class="pill t">task-service :8001</span>
+    <span class="pill a">HTTP síncrono</span>
+    <span class="pill">Tokens opacos</span>
+    <span class="pill">18 tests</span>
+  </div>
+</section>
+
+<!-- ============ 2 · EL PROBLEMA ============ -->
+<section class="slide">
+  <div class="kicker">El punto de partida</div>
+  <h2>Dos servicios que no se conocen</h2>
+
+  <div class="grid g2">
+    <div class="card">
+      <h3 style="color:var(--muted)">Sin microservicios</h3>
+      <p>Un solo proyecto, una base de datos, un <code>JOIN</code> y listo.</p>
+      <p class="small">Funciona. Es rápido de construir. Y cuando un equipo quiere
+         publicar su parte de forma independiente, no hay por dónde empezar.</p>
+    </div>
+    <div class="card">
+      <h3 style="color:var(--tasks)">Con microservicios</h3>
+      <p>Dos procesos, dos bases. Y entonces surge la pregunta que no tiene
+         atajo: <strong>¿cómo sabe el uno que el otro tiene ese dato?</strong></p>
+    </div>
+  </div>
+
+  <div class="note">
+    <b>La respuesta obvia —"que lo pregunte"— es exactamente el diseño de este proyecto.</b>
+    Y resulta que no es una solución improvisada: es un patrón real, con un nombre
+    (<em>service client</em> o API Gateway), con sus ventajas y con sus costes.
+  </div>
+
+  <p class="small">Lo que sigue es ese patrón, construido entero, midiendo lo que cuesta.</p>
+</section>
+
+<!-- ============ 3 · ARQUITECTURA ============ -->
+<section class="slide">
+  <div class="kicker">Arquitectura</div>
+  <h2>Dos dueños, dos bases, un contrato</h2>
+
+  <div class="dia">
+    <div class="drow">
+      <div class="dnode cli">
+        <div class="lab">Cliente</div>
+        <div class="nm">curl · Postman · UI</div>
+      </div>
+      <div class="dlink r">
+        <div class="cap"><b>POST /api/tasks</b>Authorization: Bearer</div>
+        <div class="bar"></div>
+        <span class="st st-2">201</span>
+      </div>
+      <div class="dnode tasks">
+        <div class="lab">task-service</div>
+        <div class="nm">:8001</div>
+        <div class="mt">database.sqlite</div>
+        <div class="mt">API REST</div>
+      </div>
+      <div class="dlink l">
+        <div class="cap"><b>GET /api/user</b>¿quién es este token?</div>
+        <div class="bar"></div>
+        <span class="st st-2">200</span>
+      </div>
+      <div class="dnode users">
+        <div class="lab">user-service</div>
+        <div class="nm">:8000</div>
+        <div class="mt">database.sqlite</div>
+        <div class="mt">identidad · headless</div>
+      </div>
+    </div>
+  </div>
+
+  <table>
+    <thead><tr><th></th><th>user-service</th><th>task-service</th></tr></thead>
+    <tbody>
+      <tr><td>Tablas propias</td><td><code>users</code>, <code>api_tokens</code></td><td><code>tasks</code></td></tr>
+      <tr><td>¿Conoce usuarios?</td><td class="ok">Sí, es el dueño</td><td class="bad">No — solo guarda el <code>user_id</code></td></tr>
+      <tr><td>¿Conoce tareas?</td><td class="bad">No</td><td class="ok">Sí, es el dueño</td></tr>
+      <tr><td>Interfaz</td><td>Ninguna</td><td class="ok">API REST + OpenAPI automática</td></tr>
+    </tbody>
+  </table>
+
+  <div class="note warn">
+    <b>Cero llaves foráneas cruzadas.</b> Una FK entre <code>tasks</code> y <code>users</code>
+    exigiría el mismo archivo de base de datos — que es justo lo que rompe el aislamiento.
+    La integridad se valida por HTTP.
+  </div>
+</section>
+
+<!-- ============ 4 · FLUJO 1 ============ -->
+<section class="slide">
+  <div class="kicker">El flujo · fase 1</div>
+  <h2>Inicio de sesión, una vez</h2>
+
+  <ol style="list-style:none;padding:0">
+    <li style="padding:0 0 22px 52px;position:relative">
+      <div style="position:absolute;left:0;top:1px;width:32px;height:32px;border-radius:50%;
+                  background:var(--panel-2);border:1px solid var(--line);color:var(--accent);
+                  font:700 14px/31px var(--mono);text-align:center">1</div>
+      El cliente manda <strong>email y contraseña</strong> a <code>POST /api/tokens</code>.
+    </li>
+    <li style="padding:0 0 22px 52px;position:relative">
+      <div style="position:absolute;left:0;top:1px;width:32px;height:32px;border-radius:50%;
+                  background:var(--panel-2);border:1px solid var(--line);color:var(--accent);
+                  font:700 14px/31px var(--mono);text-align:center">2</div>
+      El user-service verifica el hash de la contraseña y emite un <strong>token opaco</strong>:
+      64 caracteres hexadecimales aleatorios, con <code>expires_at</code> a 60 minutos.
+    </li>
+    <li style="padding:0 0 22px 52px;position:relative">
+      <div style="position:absolute;left:0;top:1px;width:32px;height:32px;border-radius:50%;
+                  background:var(--panel-2);border:1px solid var(--line);color:var(--accent);
+                  font:700 14px/31px var(--mono);text-align:center">3</div>
+      En la tabla <strong>solo se guarda su SHA-256</strong>. Si alguien lee la base de datos,
+      no puede suplantar a nadie.
+    </li>
+    <li style="padding:0 0 0 52px;position:relative">
+      <div style="position:absolute;left:0;top:1px;width:32px;height:32px;border-radius:50%;
+                  background:var(--panel-2);border:1px solid var(--line);color:var(--accent);
+                  font:700 14px/31px var(--mono);text-align:center">4</div>
+      El token en claro viaja <strong>una única vez</strong>, en la respuesta <code>201</code>.
+    </li>
+  </ol>
+
+  <div class="note">
+    <b>SHA-256 para el token, PBKDF2 para la contraseña:</b> el token no es una contraseña
+    que alguien pueda escoger — son 32 bytes de <code>secrets.token_hex</code>, no hay espacio
+    de búsqueda que recorrer. La contraseña sí la elige el usuario, y ahí el hash lento
+    (<strong>PBKDF2</strong>, de la stdlib, con <code>hmac.compare_digest</code>) es el que importa.
+    Todo sin dependencias nuevas.
+  </div>
+</section>
+
+<!-- ============ 5 · FLUJO 2 ============ -->
+<section class="slide">
+  <div class="kicker">El flujo · fase 2</div>
+  <h2>Cada request posterior</h2>
+
+  <ol style="list-style:none;padding:0">
+    <li style="padding:0 0 16px 52px;position:relative">
+      <div style="position:absolute;left:0;top:1px;width:32px;height:32px;border-radius:50%;
+                  background:var(--panel-2);border:1px solid var(--line);color:var(--accent);
+                  font:700 14px/31px var(--mono);text-align:center">1</div>
+      El cliente envía <code>Authorization: Bearer &lt;token&gt;</code>.
+    </li>
+    <li style="padding:0 0 16px 52px;position:relative">
+      <div style="position:absolute;left:0;top:1px;width:32px;height:32px;border-radius:50%;
+                  background:var(--panel-2);border:1px solid var(--line);color:var(--accent);
+                  font:700 14px/31px var(--mono);text-align:center">2</div>
+      El task-service <strong>no puede validarlo</strong>: la tabla de tokens no es suya.
+      Así que se lo reenvía al user-service.
+    </li>
+    <li style="padding:0 0 16px 52px;position:relative">
+      <div style="position:absolute;left:0;top:1px;width:32px;height:32px;border-radius:50%;
+                  background:var(--panel-2);border:1px solid var(--line);color:var(--accent);
+                  font:700 14px/31px var(--mono);text-align:center">3</div>
+      <code>GET /api/user</code> responde <span class="ok">200 {id, name, email}</span> o
+      <span class="bad">401</span>. Es la <em>introspección de tokens</em> de un identity provider.
+    </li>
+    <li style="padding:0 0 16px 52px;position:relative">
+      <div style="position:absolute;left:0;top:1px;width:32px;height:32px;border-radius:50%;
+                  background:var(--panel-2);border:1px solid var(--line);color:var(--accent);
+                  font:700 14px/31px var(--mono);text-align:center">4</div>
+      El <code>user_id</code> de la tarea sale <strong>de la identidad</strong>, nunca del cuerpo
+      del request.
+    </li>
+    <li style="padding:0 0 0 52px;position:relative">
+      <div style="position:absolute;left:0;top:1px;width:32px;height:32px;border-radius:50%;
+                  background:var(--panel-2);border:1px solid var(--line);color:var(--accent);
+                  font:700 14px/31px var(--mono);text-align:center">5</div>
+      Para una tarea concreta se comprueba la propiedad: si no es tuya, <span class="bad">403</span>.
+    </li>
+  </ol>
+
+  <div class="note err">
+    <b>Y si el user-service está caído, el task-service devuelve 503 en todo.</b>
+    Nadie puede autenticarse. Eso no es un defecto de implementación: es el precio,
+    visible y medible, de no duplicar el estado de identidad.
+  </div>
+</section>
+
+<!-- ============ 6 · LA FRONTERA ============ -->
+<section class="slide">
+  <div class="kicker">La pieza clave</div>
+  <h2>Toda la frontera de red vive en un sitio</h2>
+
+<pre><code><span class="c-c"># task-service/app/user_service_client.py — el único archivo que sabe que existe HTTP</span>
+<span class="c-k">def</span> <span class="c-f">verify_token</span>(<span class="c-v">token</span>: <span class="c-k">str</span>) -&gt; <span class="c-k">dict</span>:
+    <span class="c-k">try</span>:
+        r = <span class="c-f">_http_get</span>(USER_SERVICE_URL + <span class="c-s">"/api/user"</span>,
+                     {<span class="c-s">"Authorization"</span>: <span class="c-s">"Bearer "</span> + token})
+    <span class="c-k">except</span> (httpx2.ConnectError, httpx2.ConnectTimeout):
+        <span class="c-k">raise</span> HTTPException(<span class="c-n">503</span>, <span class="c-s">"user-service no está en pie …"</span>)
+
+    <span class="c-k">if</span> r.status_code == <span class="c-n">401</span>:
+        <span class="c-k">raise</span> HTTPException(<span class="c-n">401</span>, <span class="c-s">"Token inválido o expirado"</span>)
+    <span class="c-k">if</span> r.status_code != <span class="c-n">200</span>:
+        <span class="c-k">raise</span> HTTPException(<span class="c-n">502</span>, <span class="c-s">"Respuesta inesperada del user-service"</span>)
+    <span class="c-k">return</span> r.<span class="c-f">json</span>()
+
+<span class="c-k">def</span> <span class="c-f">_http_get</span>(<span class="c-v">url</span>, <span class="c-v">headers</span>):          <span class="c-c"># el seam: los tests lo sustituyen</span>
+    <span class="c-k">with</span> httpx2.<span class="c-f">Client</span>(timeout=<span class="c-n">2</span>) <span class="c-k">as</span> http:
+        <span class="c-k">return</span> http.<span class="c-f">get</span>(url, headers=headers)</code></pre>
+
+  <div class="grid g2">
+    <div class="note ok" style="margin:0">
+      <b>Los endpoints no saben nada del tema.</b> No hay URLs, ni timeouts, ni códigos de
+      error del peer fuera de este archivo. Es el patrón de un <b>API Gateway</b>: tratar al
+      otro microservicio como si fuera una función local.
+    </div>
+    <div class="note warn" style="margin:0">
+      <b>La distinción que importa:</b> <code>401</code> es "este token no vale" y baja como
+      <code>401</code> propio. El peer caído es <code>503</code>, con el comando para
+      levantarlo; una respuesta inesperada es <code>502</code>. Confundir "vuelve a loguearte"
+      con "el sistema está roto" es el error clásico.
+    </div>
+  </div>
+</section>
+
+<!-- ============ 7 · SEGURIDAD ============ -->
+<section class="slide wide">
+  <div class="kicker">Seguridad</div>
+  <h2>El token y sus trampas</h2>
+
+  <div class="grid g3">
+    <div class="metric m-warn">
+      <div class="n">60 min</div>
+      <div class="l">vida del token (<code>expires_at</code> es <strong>NOT NULL</strong>:
+        un token sin caducidad no existe)</div>
+    </div>
+    <div class="metric m-acc">
+      <div class="n">64</div>
+      <div class="l">caracteres hex aleatorios por token, de <code>secrets.token_hex</code></div>
+    </div>
+    <div class="metric m-ok">
+      <div class="n">1</div>
+      <div class="l">respuesta para credenciales malas <strong>y</strong> email inexistente:
+        mismo <code>401</code>, mismo mensaje</div>
+    </div>
+  </div>
+
+  <div class="grid g2" style="margin-top:6px">
+    <div class="card">
+      <h3>Anti-enumeración</h3>
+      <p class="small">Contraseña equivocada y email fantasma devuelven exactamente lo mismo.
+         Un atacante no puede usar el endpoint para adivinar qué correos están registrados.
+         Verificado con dos <code>curl</code> en el E2E: las dos respuestas son idénticas.</p>
+    </div>
+    <div class="card">
+      <h3>El header malformado no viaja</h3>
+      <p class="small">Si el header no es <code>Bearer &lt;token&gt;</code>, se rechaza con
+         <span class="bad">401</span> en <code>deps.py</code> <strong>sin llamar a la red</strong>.
+         El malformado es problema del cliente, no del IdP.</p>
+    </div>
+  </div>
+
+  <div class="note warn">
+    <b>Trampa de sqlite:</b> la base no conserva el <code>tzinfo</code>. En las columnas, las
+    fechas se guardan <strong>naive en UTC</strong>; el <code>Z</code> de la respuesta ISO 8601
+    se añade al final, con <code>.replace(tzinfo=UTC)</code>, justo antes de serializar.
+  </div>
+</section>
+
+<!-- ============ 8 · EL CAMBIO ============ -->
+<section class="slide">
+  <div class="kicker">La lección</div>
+  <h2>Un bug de diseño que la auth silenció</h2>
+
+  <div class="grid g2">
+    <div class="card">
+      <h3 style="color:var(--err)">Antes</h3>
+<pre style="margin:0"><code><span class="c-c"># el cliente afirmaba de quién era la tarea</span>
+user_id = payload[<span class="c-s">"user_id"</span>]
+
+<span class="c-k">if</span> <span class="c-f">find_user</span>(user_id) <span class="c-k">is</span> <span class="c-k">None</span>:
+    <span class="c-k">raise</span> HTTPException(<span class="c-n">422</span>, <span class="c-s">"usuario inexistente"</span>)
+
+task = Task(title=payload[<span class="c-s">"title"</span>],
+            user_id=user_id)</code></pre>
+      <p class="small" style="margin-top:12px">La validación solo comprobaba que el usuario
+        <strong>existiera</strong> — no que quien llamara <strong>fuera</strong> ese usuario.</p>
+    </div>
+    <div class="card">
+      <h3 style="color:var(--ok)">Ahora</h3>
+<pre style="margin:0"><code><span class="c-v">@router</span>.<span class="c-f">post</span>(<span class="c-s">"/api/tasks"</span>, status_code=<span class="c-n">201</span>)
+<span class="c-k">def</span> <span class="c-f">create</span>(payload: TaskCreate,
+           user: <span class="c-k">dict</span> = Depends(get_current_user)):
+    <span class="c-k">return</span> Task(title=payload.title,
+                user_id=user[<span class="c-s">"id"</span>])</code></pre>
+      <p class="small" style="margin-top:12px">Una validación de existencia <strong>no es una
+        autorización</strong>. Con autenticación, el <code>user_id</code> dejó de ser un dato que
+        el cliente afirma y pasó a ser una identidad que el sistema resuelve.</p>
+    </div>
+  </div>
+
+  <div class="note">
+    <b>Y ninguna validación de <code>user_id</code> quedó en el código.</b> No es un descuido:
+    la dependencia ya preguntó lo mismo por el mismo canal. Preguntarlo otra vez era pagar
+    la latencia otra vez para obtener la misma respuesta.
+  </div>
+
+  <pre style="margin-top:6px"><code>$ curl -X POST .../api/tasks -H "Authorization: Bearer $T" \
+       -d '{"title":"Zapatos de boda","user_id":99}'
+{"title":"Zapatos de boda","user_id":1,...}   <span class="c-c"># el 99 se descartó</span></code></pre>
+</section>
+
+<!-- ============ 9 · ERRORES REALES ============ -->
+<section class="slide">
+  <div class="kicker">Lo que salió mal</div>
+  <h2>Tres errores que nadie encontró leyendo el código</h2>
+
+  <div class="grid g3">
+    <div class="card">
+      <h3>Tres tests rojos por un reloj</h3>
+      <p class="small">Fechas <em>aware</em> comparadas con fechas <em>naive</em>: el test dio
+        <code class="bad">3 failed, 4 passed</code>. sqlite no conserva el <code>tzinfo</code>,
+        así que la comparación de caducidad explotaba por mezcla de relojes.</p>
+      <p class="small" style="color:var(--ok)">→ Columnas naive en UTC y el
+        <code>Z</code> solo al responder.</p>
+    </div>
+    <div class="card">
+      <h3>El DELETE en 401</h3>
+      <p class="small">Un parámetro <code>authorization: str = None</code> sin
+        <code>Header()</code> — FastAPI lo leyó como <strong>query param</strong>. El header
+        nunca llegaba y el DELETE respondía <code class="bad">401</code> siempre.</p>
+      <p class="small" style="color:var(--ok)">→ En FastAPI nada es implícito:
+        el header se declara.</p>
+    </div>
+    <div class="card">
+      <h3>El test que expiró otra fila</h3>
+      <p class="small"><code>first()</code> traía el token de <strong>otro test anterior</strong>.
+        El test expiraba una fila cualquiera y el aserto pasaba o fallaba por casualidad.</p>
+      <p class="small" style="color:var(--ok)">→ El test expira la fila del token que
+        realmente usa, buscando por su hash.</p>
+    </div>
+  </div>
+
+  <div class="note">
+    <b>Los tres los encontraron los tests o el <code>curl</code> del E2E, no la lectura.</b>
+    Dos de ellos además solo aparecían en el camino infeliz: token expirado y header ausente.
+  </div>
+</section>
+
+<!-- ============ 10 · LOS TESTS ============ -->
+<section class="slide">
+  <div class="kicker">Testing</div>
+  <h2>18 tests, cero servidores, cero puertos</h2>
+
+  <table>
+    <thead><tr><th>Necesidad</th><th>Cómo se resuelve</th></tr></thead>
+    <tbody>
+      <tr><td>Identidad del usuario</td><td><code>app.dependency_overrides</code> —
+          un dict <code>{id, name, email}</code> fijo</td></tr>
+      <tr><td>El IdP en la frontera</td><td>monkeypatch de <code>_http_get</code> —
+          un stub que responde el status que toca</td></tr>
+      <tr><td>Base de datos</td><td>sqlite <code>:memory:</code> + <code>StaticPool</code>
+          (una sola conexión para todo el test)</td></tr>
+      <tr><td>Cliente HTTP de tests</td><td>TestClient de FastAPI (que en 2026 exige
+          <code>httpx2</code>)</td></tr>
+      <tr><td>Contaminación entre tests</td><td>fixture autouse que borra los overrides al
+          empezar cada test — nadie arrastra identidad del anterior</td></tr>
+    </tbody>
+  </table>
+
+  <div class="grid g2">
+    <div class="note ok" style="margin:0">
+      <b>Un test del task-service no sabe que existe HTTP.</b> La frontera está stubbeada,
+      la identidad viene de un override: corren en milisegundos y sin un solo socket abierto.
+    </div>
+    <div class="note" style="margin:0">
+      <b>Los tres caminos de la frontera se prueban a mano.</b> 401 del IdP, ConnectError y
+      status inesperado: cada uno con su stub y su status esperado (401, 503, 502).
+    </div>
+  </div>
+</section>
+
+<!-- ============ 11 · NÚMEROS ============ -->
+<section class="slide">
+  <div class="kicker">Estado medido</div>
+  <h2>Dónde está el proyecto hoy</h2>
+
+  <div class="grid g3">
+    <div class="metric m-ok">
+      <div class="n">18</div>
+      <div class="l">tests en verde<br><span class="small">7 user · 11 task</span></div>
+    </div>
+    <div class="metric m-dim">
+      <div class="n">0</div>
+      <div class="l">servidores levantados para correr los tests<br>
+        <span class="small">TestClient + overrides + stubs</span></div>
+    </div>
+    <div class="metric m-ok">
+      <div class="n">0</div>
+      <div class="l">llaves foráneas cruzadas entre servicios</div>
+    </div>
+  </div>
+
+  <div class="grid g3" style="margin-top:4px">
+    <div class="metric m-acc">
+      <div class="n">15 ms</div>
+      <div class="l">login real medido (<code>POST /api/tokens</code> → 201)</div>
+    </div>
+    <div class="metric m-acc">
+      <div class="n">99 ms</div>
+      <div class="l"><code>POST /api/tasks</code> con la introspección al IdP incluida:
+        el salto de red, visible</div>
+    </div>
+    <div class="metric m-err">
+      <div class="n">503</div>
+      <div class="l">si el user-service cae, el task-service no autentica a nadie</div>
+    </div>
+  </div>
+
+  <div class="note">
+    <b>Y la prueba de que es un sistema distribuido:</b> apaga el user-service
+    (<code>Ctrl+C</code>) y el task-service responde 503, con el comando exacto para
+    levantar lo que falta. Ninguna cantidad de código dentro del task-service pudo
+    evitarlo — la información no está en su proceso.
+  </div>
+</section>
+
+<!-- ============ 12 · DECISIONES ============ -->
+<section class="slide">
+  <div class="kicker">Criterio</div>
+  <h2>Decisiones y el porqué</h2>
+
+  <table>
+    <thead><tr><th>Decisión</th><th>Alternativa descartada</th><th>Por qué</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>Token opaco + SHA-256</strong></td>
+        <td>JWT</td>
+        <td>Un único dueño del estado de identidad y revocación inmediata — probada: el
+            <code>DELETE</code> responde 204 y el token muere al instante en los dos servicios.</td>
+      </tr>
+      <tr>
+        <td><strong>PBKDF2 de la stdlib</strong></td>
+        <td>passlib / argon2-cffi</td>
+        <td>Capítulo de fundamentos: cero dependencias nativas para el hashing, y
+            <code>hmac.compare_digest</code> para la comparación.</td>
+      </tr>
+      <tr>
+        <td><strong>uv por servicio</strong></td>
+        <td>Workspace / monorepo</td>
+        <td>Cada servicio su <code>pyproject.toml</code> y su <code>.venv</code> — el paralelo
+            exacto de un <code>composer install</code> por servicio.</td>
+      </tr>
+      <tr>
+        <td><strong>SQLite</strong></td>
+        <td>MySQL / PostgreSQL</td>
+        <td>Dos archivos, dos procesos, cero infraestructura. El aislamiento del ejercicio
+            se demuestra igual.</td>
+      </tr>
+      <tr>
+        <td><strong>Tests con overrides</strong></td>
+        <td>Servers en pie / respx</td>
+        <td>Herméticos y sin red real: la identidad por <code>dependency_overrides</code>, el
+            IdP por monkeypatch. Un test no depende de otro proceso.</td>
+      </tr>
+      <tr>
+        <td><strong>Columnas naive en UTC</strong></td>
+        <td>Datetime aware en columnas</td>
+        <td>sqlite no conserva <code>tzinfo</code>; guardar aware es pedir comparaciones
+            rotas. El <code>Z</code> es un asunto de la respuesta, no del almacenamiento.</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ============ 13 · ROADMAP ============ -->
+<section class="slide">
+  <div class="kicker">Hacia dónde</div>
+  <h2>El siguiente paso no es RabbitMQ</h2>
+
+  <div class="grid g2">
+    <div>
+      <h3 style="color:var(--ok)">Primero — barata y evita incidentes</h3>
+      <ol class="small" style="padding-left:20px">
+        <li><code>X-Request-Id</code> propagado + métricas</li>
+        <li>Circuit breaker (de 2 s de espera a ~0 ms)</li>
+        <li>Refresh tokens</li>
+        <li>API versioning</li>
+        <li>Contratos de consumidor en CI</li>
+      </ol>
+    </div>
+    <div>
+      <h3 style="color:var(--muted)">Después — solo si el punto 2 duele</h3>
+      <ol class="small" style="padding-left:20px">
+        <li>RabbitMQ (de síncrono a asíncrono)</li>
+        <li>Docker + health checks</li>
+        <li>Gateway o JWT, si aparece un tercer consumidor</li>
+      </ol>
+    </div>
+  </div>
+
+  <div class="note warn">
+    <b>El orden importa:</b> los primeros cinco cuestan horas y evitan incidentes.
+    RabbitMQ puede esperar sin que nadie lo note. Añadirlo antes es infrastructure
+    por adelantado.
+  </div>
+
+  <div class="note">
+    <b>El riesgo estructural que queda:</b> los tests <em>stubbean</em> al otro servicio.
+    Si alguien cambia la forma del <code>401</code> en el user-service, los tests del
+    task-service seguirán en verde y se rompe en producción. Los contratos de consumidor
+    lo resuelven, y es el paso que más duele no hacer.
+  </div>
+</section>
+
+<!-- ============ 14 · CIERRE ============ -->
+<section class="slide">
+  <div class="kicker">Gracias</div>
+  <h2 style="font-size:clamp(1.9rem,4.2vw,3.2rem);border:none;margin-bottom:0">Dos servicios.<br>Una red.<br>Ningún atajo.</h2>
+
+  <p class="lead" style="margin-top:22px">Todo lo que hay aquí funciona de verdad:
+     está probado, medido y verificado con peticiones reales.</p>
+
+  <div style="margin-top:34px">
+    <span class="pill u">user-service :8000 · database.sqlite</span>
+    <span class="pill t">task-service :8001 · database.sqlite</span>
+  </div>
+
+  <div class="note" style="margin-top:34px">
+    <b>Toda la serie</b> con este mismo enfoque práctico —
+    microservicios reales, APIs, colas, testing y despliegue:<br><br>
+    <strong style="font-size:1.1em">www.desarrollolibre.net</strong>
+  </div>
+</section>
+
+</main>
+
+<div class="bar" id="bar"></div>
+<div class="hud">
+  <button id="prev" aria-label="Anterior">←</button>
+  <span id="counter">1 / 14</span>
+  <button id="next" aria-label="Siguiente">→</button>
+</div>
+<div class="help"><kbd>←</kbd> <kbd>→</kbd> o <kbd>espacio</kbd> para navegar</div>
+<div class="foot">Sistema de Tareas Inteligente · dos microservicios FastAPI hablando por HTTP</div>
+
+<script>
+(function () {
+  var slides = Array.prototype.slice.call(document.querySelectorAll('.slide'));
+  var i = 0;
+  var bar = document.getElementById('bar');
+  var counter = document.getElementById('counter');
+
+  function show(n) {
+    i = Math.max(0, Math.min(slides.length - 1, n));
+    slides.forEach(function (s, k) { s.classList.toggle('active', k === i); });
+    bar.style.width = ((i + 1) / slides.length * 100) + '%';
+    counter.textContent = (i + 1) + ' / ' + slides.length;
+    try { history.replaceState(null, '', '#' + (i + 1)); } catch (e) {}
+  }
+
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'ArrowRight' || e.key === 'PageDown' || e.key === ' ') { e.preventDefault(); show(i + 1); }
+    if (e.key === 'ArrowLeft'  || e.key === 'PageUp')              { e.preventDefault(); show(i - 1); }
+    if (e.key === 'Home') { show(0); }
+    if (e.key === 'End')  { show(slides.length - 1); }
+  });
+
+  document.getElementById('next').addEventListener('click', function () { show(i + 1); });
+  document.getElementById('prev').addEventListener('click', function () { show(i - 1); });
+
+  document.addEventListener('click', function (e) {
+    if (e.target.closest('.hud')) return;
+    show(e.clientX < window.innerWidth * 0.28 ? i - 1 : i + 1);
+  });
+
+  var start = parseInt((location.hash || '').slice(1), 10);
+  show(isNaN(start) ? 0 : start - 1);
+})();
+</script>
+
+</body>
+</html>
