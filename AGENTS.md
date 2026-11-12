@@ -1,6 +1,6 @@
 # AGENTS.md — demo-microservicios (formato FastAPI)
 
-Reglas del repo y patrones asentados hasta el capítulo 1.
+Reglas del repo y patrones asentados hasta el capítulo 3.
 
 ## Reglas duras
 
@@ -29,6 +29,31 @@ Reglas del repo y patrones asentados hasta el capítulo 1.
 - Errores de control de acceso: dueño equivocado **403** (la tarea no es
   tuya), no 404. Status inválido **422**. Login: mismo 401 con el mismo
   mensaje para credenciales malas y email inexistente (anti-enumeración).
+- Rate limit del login (capítulo 3): limitador propio en
+  `user-service/app/rate_limit.py` — ventana deslizante en memoria del
+  proceso (cola por clave + `threading.Lock`), dos contadores: **5/min por
+  cuenta** (clave `email:sha256|ip`) y **20/min por IP**, cuenta TODOS los
+  intentos (no solo los fallidos). Al agotarse: **429** con header
+  `Retry-After`. Límites por env `LOGIN_THROTTLE_PER_ACCOUNT/PER_IP/
+  DECAY_SECONDS` (5/20/60), ver `user-service/app/config.py`.
+  - La dependencia `rate_limit_login(request, payload)` va en
+    `dependencies=[...]` de `POST /api/tokens`; el límite es de la ruta, no
+    un middleware global.
+  - `client_ip(request)` = IP del **socket** (`request.client.host`), nunca
+    cabeceras (`X-Forwarded-For` se falsifica a mano). Detrás de proxy en
+    producción: uvicorn `--proxy-headers --forwarded-allow-ips <ip del
+    proxy>`, jamás `*`.
+  - Fixture autouse `limitador_limpio` en `user-service/tests/conftest.py`
+    resetea los contadores antes/después de cada test; el seed borra también
+    `api_tokens` (la BD `:memory:` con `StaticPool` persiste entre tests).
+  - Contadores **por proceso**: reiniciar uvicorn los resetea; con N
+    réplicas habría que pasarlos a Redis (quedó abierto en el capítulo 3).
+- Logging: `logging.basicConfig(level=logging.INFO)` en `user-service/app/
+  main.py` (sin él los INFO van a ninguna parte). Los mensajes de negocio
+  llevan los campos como JSON en el propio mensaje (`json.dumps` con
+  separadores por defecto — lleva espacio, no asertar formato exacto):
+  WARNING `Failed login attempt {email, ip, account_exists}`, INFO
+  `API token issued/revoked {...}`. Nunca la contraseña.
 
 ## La frontera (patrón central)
 
@@ -70,7 +95,7 @@ ana.torres@example.com y luis.ramirez@example.com / `password`.
 ## Comandos útiles
 
 ```bash
-cd user-service && uv run pytest          # 7 tests
+cd user-service && uv run pytest          # 17 tests
 cd task-service && uv run pytest          # 11 tests
 uv run uvicorn app.main:app --port 8000   # IdP (desde user-service/)
 uv run uvicorn app.main:app --port 8001   # tareas (desde task-service/)

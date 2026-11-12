@@ -1,0 +1,1185 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>Guion de vídeo — Capítulo 1: Estructura base (microservicios en FastAPI)</title>
+
+<meta name="description" content="Match transcripción ↔ código del vídeo 1 de la serie FastAPI: bloque de narración + fragmento exacto del proyecto, en el mismo ritmo de la grabación.">
+<meta name="robots" content="noindex, nofollow">
+<meta name="theme-color" content="#0969da">
+
+<meta property="og:type" content="article">
+<meta property="og:locale" content="es_ES">
+<meta property="og:title" content="Guion de vídeo — Capítulo 1: Estructura base (microservicios en FastAPI)">
+<meta property="og:description" content="Bloques de narración con los fragmentos exactos de código del proyecto, en el orden y ritmo de la grabación.">
+
+</head>
+<body>
+
+<article>
+
+<header>
+<h1>Guion de vídeo — Capítulo 1: Estructura base (microservicios en FastAPI)</h1>
+
+<ul>
+<li><strong>Vídeo:</strong> Microservicios en FastAPI — 01 · estructura base</li>
+<li><strong>Etiqueta del repositorio:</strong> <code>0.1</code> (una etiqueta por vídeo: <code>0.2</code>, <code>0.3</code>, …)</li>
+<li><strong>Servicios:</strong> <code>user-service</code> (:8000, IdP) y <code>task-service</code> (:8001, tareas)</li>
+<li><strong>Pruebas unitarias:</strong> task-service 11 · user-service 7 (estado de la etiqueta <code>0.1</code>)</li>
+</ul>
+
+<p><strong>Cómo usar este guion:</strong> cada bloque numerado conserva el ritmo y el
+orden de la grabación; debajo va el fragmento exacto de código del proyecto que
+aparece en pantalla, con su ruta. Se quitaron muletillas y se limpiaron errores
+de la transcripción (p. ej. «FASAPI» → FastAPI, «cool» → curl, «Played» → Blade,
+«freír gatos» → 404), manteniendo el tono.</p>
+
+<div>
+<p><strong>Nota de versiones.</strong> Los fragmentos corresponden al estado del
+capítulo 1 (lo que sale en la grabación). El repo actual ya lleva el capítulo 3,
+así que tres archivos de <code>user-service</code> cambiaron:
+<code>routes_tokens.py</code> (dependencia de rate limit + logs JSON),
+<code>main.py</code> (<code>logging.basicConfig</code>) y <code>config.py</code>
+(<code>LOGIN_THROTTLE_*</code>). Esos tres se muestran aquí en su forma del
+capítulo 1.</p>
+</div>
+
+<h2>Mapa rápido de archivos tocados en pantalla</h2>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Bloque</th><th>Archivo</th></tr>
+<tr><td>6–7</td><td><code>task-service/app/config.py</code></td></tr>
+<tr><td>8</td><td><code>task-service/app/db.py</code></td></tr>
+<tr><td>9</td><td><code>task-service/app/main.py</code></td></tr>
+<tr><td>10</td><td><code>task-service/app/models.py</code></td></tr>
+<tr><td>11</td><td><code>task-service/app/schemas.py</code></td></tr>
+<tr><td>12</td><td><code>task-service/app/routes_tasks.py</code></td></tr>
+<tr><td>13</td><td><code>task-service/app/deps.py</code></td></tr>
+<tr><td>14</td><td><code>task-service/app/user_service_client.py</code></td></tr>
+<tr><td>16</td><td><code>user-service/app/seed.py</code>, <code>app/security.py</code></td></tr>
+<tr><td>17</td><td><code>user-service/app/schemas.py</code></td></tr>
+<tr><td>18</td><td><code>user-service/app/models.py</code></td></tr>
+<tr><td>19</td><td><code>user-service/app/db.py</code>, <code>app/config.py</code>, <code>app/main.py</code></td></tr>
+<tr><td>20</td><td><code>user-service/app/routes_tokens.py</code>, <code>app/auth.py</code></td></tr>
+<tr><td>25–28</td><td>respuestas 401 / 201 / 503 + curl</td></tr>
+</table>
+
+</header>
+
+<nav>
+<h2>Contenido</h2>
+<ol>
+<li><a href="#bloque-1">Introducción</a></li>
+<li><a href="#bloque-2">La idea: dos servicios y la autenticación que vive en otro</a></li>
+<li><a href="#bloque-3">Ya está implementado, no partimos de cero</a></li>
+<li><a href="#bloque-4">Sin UI de servidor: la documentación automática</a></li>
+<li><a href="#bloque-5">Tour rápido por la documentación automática</a></li>
+<li><a href="#bloque-6">Los proyectos y los puertos (8000 / 8001)</a></li>
+<li><a href="#bloque-7">La configuración del cliente HTTP: el timeout</a></li>
+<li><a href="#bloque-8">La base de datos (SQLite, SessionLocal, get_db)</a></li>
+<li><a href="#bloque-9">Arrancar la aplicación (main.py)</a></li>
+<li><a href="#bloque-10">El modelo de tareas: el usuario es un entero, no una FK</a></li>
+<li><a href="#bloque-11">Los esquemas (Pydantic)</a></li>
+<li><a href="#bloque-12">Las rutas: dueño de la tarea, 404 y 403</a></li>
+<li><a href="#bloque-13">deps.py: la credencial en la cabecera</a></li>
+<li><a href="#bloque-14">verify_token: la petición HTTP al user-service</a></li>
+<li><a href="#bloque-15">deps ↔ user_service_client: modularidad</a></li>
+<li><a href="#bloque-16">user-service: la semilla y security (hash y token)</a></li>
+<li><a href="#bloque-17">Los esquemas de usuarios</a></li>
+<li><a href="#bloque-18">El modelo de usuarios y el token (FK, hash, caducidad)</a></li>
+<li><a href="#bloque-19">La BD, la configuración y el main de usuarios</a></li>
+<li><a href="#bloque-20">Las rutas del IdP: login, /user y revocar</a></li>
+<li><a href="#bloque-21">Métodos internos y pruebas unitarias</a></li>
+<li><a href="#bloque-22">Las dos conclusiones y la definición de microservicio</a></li>
+<li><a href="#bloque-23">La presentación: repaso y el flujo completo</a></li>
+<li><a href="#bloque-24">Lógica de negocio fuera de lugar, y el token</a></li>
+<li><a href="#bloque-25">DEMO: sin token, un bonito 401</a></li>
+<li><a href="#bloque-26">DEMO: iniciar sesión en el user-service</a></li>
+<li><a href="#bloque-27">DEMO: crear y listar tareas</a></li>
+<li><a href="#bloque-28">DEMO: ¿y si el user-service se muere? (503)</a></li>
+<li><a href="#bloque-29">Cierre: etiqueta 0.1 y siguiente clase</a></li>
+</ol>
+</nav>
+
+<hr>
+
+
+<h2 id="bloque-1">Bloque 1 — Introducción</h2>
+
+<p>Vengo a hacer esta guía: microservicios, que en la serie Laravel hice sobre el
+ecosistema de Laravel, y ahora voy a hacer lo mismo con FastAPI. Lo interesante
+de esto es comparar ambas implementaciones y ver qué ganamos, qué perdemos,
+etcétera. Aparte, por aquí voy a aprovechar para hacer algún microservicio, en
+algún punto, con Flask o con Django; y seguimos un poquito la misma filosofía,
+con algunas cositas diferentes.</p>
+
+<p>Al igual que el de Laravel —en caso de que lo hayas visto; si no, lo tienes
+por aquí—, en una publicación reúno todos los vídeos: fueron unos 11. Y recuerda
+que lo tienes en mi plataforma de academia, tanto en los libros como en los
+cursos, y puedes iniciar gratis; si te interesa, puedes adquirirlo para tener
+más contenido. Aparte, seguramente subiremos vídeos sobre microservicios más
+específicos que dejaré solamente para el recurso de pago.</p>
+
+<p>Ya con la introducción dada: aquí la idea es hacer un microservicio —como un
+todo— bastante sencillo.</p>
+
+
+<h2 id="bloque-2">Bloque 2 — La idea: dos servicios y la autenticación que vive en otro</h2>
+
+<p>Vamos a comenzar, igual que hicimos con el de Laravel, con dos simples
+servicios: uno de tareas y otro para usuarios. El chiste se cuenta solo: un
+CRUD de tareas —ya lo vamos a ver en unos momentos, por aquí ya lo tenemos— y,
+para hacer cada operación, obviamente el usuario tiene que estar autenticado. Y
+aquí la autenticación no es local a esta aplicación de tasks —es simplemente
+una aplicación en FastAPI—: depende de otro servicio. Voy a emplear
+«microservicio», «servicio» y «aplicación» como sinónimos. En este caso, el otro
+servicio sería el de user-service, y este se conecta a él mediante peticiones
+HTTP. Sí que existen formas más eficientes —a lo largo de esta guía iremos
+viendo otras cosas y cómo configurarlas correctamente—, pero la idea es
+simplemente dar una introducción a los microservicios con FastAPI: la esencia
+de FastAPI, principalmente, e ir desde la mínima expresión hasta llegar a algo
+un poco más completo. Así que, otra vez, es una guía introductoria.</p>
+
+<h3><code>README.md</code> (raíz del proyecto)</h3>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>servicio</th><th>puerto</th><th>qué hace</th></tr>
+<tr><td>user-service</td><td>8000</td><td>IdP: login por email/password, tokens opacos con TTL de 60 min</td></tr>
+<tr><td>task-service</td><td>8001</td><td>CRUD de tareas por usuario; confía la identidad al IdP por HTTP</td></tr>
+</table>
+
+
+<h2 id="bloque-3">Bloque 3 — Ya está implementado, no partimos de cero</h2>
+
+<p>Lo siguiente: tal cual puedes ver, la implementación ya la tengo; no la voy a
+hacer desde cero. Tú tienes el código fuente, y yo te voy a dar las
+aplicaciones —los archivos— más importantes. Esto lo hago así para no alargar
+esta sección y que se haga diez veces más larga.</p>
+
+<p>Y como siempre, ya doy por hecho que tienes conocimientos al menos básicos de
+FastAPI. Si no los tienes: en mi blog hay varias publicaciones, tengo un libro
+comunitario que puedes iniciar completamente gratis o, si me quieres apoyar,
+también puedes ir por la solución completa; al igual que el curso, que lo tengo
+tanto en mi plataforma como en Udemy, y puedes comenzar gratis. Los
+conocimientos necesarios son, más que nada, que sepas cómo hacer un CRUD básico
+y lo que ello implica. Así que, ahora sí, vamos a comenzar.</p>
+
+
+<h2 id="bloque-4">Bloque 4 — Sin UI de servidor: la documentación automática</h2>
+
+<p>Lo comentado antes: tenemos dos servicios. A diferencia de la aplicación en
+Laravel, que estábamos renderizando con Blade, aquí no quise hacerlo para no
+meter vistas y complicar un poco más el asunto, ya que creo que lo podemos
+aprovechar más adelante conectando una aplicación —por ejemplo, en Vue o en
+React— y consumiendo los mismos servicios. Por lo tanto, de momento vamos a
+emplear la documentación automática, cosa que no tenemos en Laravel. Y aquí un
+poco lo mismo: dependiendo del ecosistema en el que te encuentres cuando
+estamos comenzando a desarrollar, podemos utilizar un esquema u otro. En este
+caso, como aquí tenemos la documentación automática, para hacer estas pruebas y
+conexiones iniciales nos viene de perlas, y luego vemos que levantamos una UI
+dependiendo de los requisitos del proyecto, del cliente o qué sé yo. Como te
+digo, en Laravel usualmente —como es un framework un poco más tradicional— ya
+le metí Blade para no complicar el asunto con Vue y demás.</p>
+
+
+<h2 id="bloque-5">Bloque 5 — Tour rápido por la documentación automática</h2>
+
+<p>Bueno, dicho esto, vamos a consumir desde aquí. Aquí tal cual puedes ver, ya
+tengo datos de hace unos días, y por aquí tengo los endpoints para obtener,
+bueno, crear una, obtenerla mediante un ID, actualizarla y eliminarla: el CRUD
+básico. Y aquí también tenemos el usuario, tal cual puedes ver: es para crear
+un API token, para eliminarlo y para obtener el usuario. Muy sencillo, en dos
+aplicaciones.</p>
+
+
+<h2 id="bloque-6">Bloque 6 — Los proyectos y los puertos (8000 / 8001)</h2>
+
+<p>Aquí tal cual puedes ver, los proyectos están justamente por aquí. Aquí
+levantamos el del usuario —importante que está en el puerto 8000, porque
+obviamente tenemos un hardcode en la aplicación de tareas que va a hacer la
+petición al de usuarios, por lo comentado inicialmente, en la forma de
+autenticarnos—; y el de tareas sería el 8001. Aunque aquí no importa cuál es el
+que quieras colocar. Y es esto básicamente, en pocas palabras: la autenticación
+va a ser, de momento, mediante una petición HTTP al user-service.</p>
+
+<h3><code>task-service/app/config.py</code></h3>
+
+<pre><code>import os
+
+
+def _int(name: str, default: int) -&gt; int:
+    return int(os.environ.get(name, str(default)))
+
+
+# Dónde vive el IdP. En producción, variable de entorno; en dev, puerto 8000.
+USER_SERVICE_URL = os.environ.get("USER_SERVICE_URL", "http://127.0.0.1:8000")
+HTTP_TIMEOUT_SECONDS = _int("HTTP_TIMEOUT_SECONDS", 2)
+
+# sqlite de este servicio; en tests, DATABASE_URL=sqlite:///:memory:
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///database.sqlite")</code></pre>
+
+
+<h2 id="bloque-7">Bloque 7 — La configuración del cliente HTTP: el timeout</h2>
+
+<p>Antes de llegar a esto, vamos a ver qué es lo que tenemos aquí, rapidito, en
+las configuraciones. Fíjate que tenemos lo comentado: el servicio de usuarios
+con el puerto 8000, y algunas configuraciones adicionales —como es totalmente
+normal—: el timeout. Si se pasa de dos segundos, la desechamos, por si acaso
+hay algunos problemas: una protección muy básica que tenemos que ir mejorando
+poco a poco.</p>
+
+<p>Ese timeout es el que usa el cliente HTTP cuando hace la petición (lo vemos
+en el bloque 14); y la URL del IdP se puede cambiar con la variable de entorno
+<code>USER_SERVICE_URL</code>, así el hardcode del 8000 solo es el valor de
+desarrollo.</p>
+
+
+<h2 id="bloque-8">Bloque 8 — La base de datos (SQLite, SessionLocal, get_db)</h2>
+
+<p>Estamos empleando SQLite. Aquí tenemos la conexión a la base de datos, un
+poco lo normal: aquí la declaramos —y esto sería para las pruebas, con
+<code>sqlite:///:memory:</code>—. Aquí tenemos lo de siempre: el engine, el
+SessionLocal, y el <code>get_db</code> —el yield— para devolver la conexión.
+Por lo tanto, este es el método que vamos a utilizar mediante una dependencia.</p>
+
+<h3><code>task-service/app/db.py</code></h3>
+
+<pre><code>from sqlalchemy import create_engine
+from sqlalchemy.orm import DeclarativeBase, sessionmaker
+
+from app import config
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+def _make_engine(url: str) -&gt; "create_engine":  # type: ignore[valid-type]
+    kwargs = {"connect_args": {"check_same_thread": False}}
+    if url.endswith("//:memory:"):
+        from sqlalchemy.pool import StaticPool
+
+        kwargs["poolclass"] = StaticPool
+    return create_engine(url, **kwargs)
+
+
+engine = _make_engine(config.DATABASE_URL)
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()</code></pre>
+
+
+<h2 id="bloque-9">Bloque 9 — Arrancar la aplicación (main.py)</h2>
+
+<p>Me estoy adelantando un poquito; creo que mejor ir de último con el main,
+para arrancar la aplicación. Muy normal: simplemente es el lifespan —con él se
+crean las tablas—, el FastAPI, levantamos la aplicación, y el
+<code>include_router</code>, con el router que había antes.</p>
+
+<h3><code>task-service/app/main.py</code></h3>
+
+<pre><code>from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+
+from app.db import Base, engine
+from app.routes_tasks import router as tasks_router
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    Base.metadata.create_all(engine)
+    yield
+
+
+app = FastAPI(
+    title="task-service",
+    description="Tareas por usuario, autenticadas vía el IdP (capítulo 1).",
+    version="0.1.0",
+    lifespan=lifespan,
+)
+app.include_router(tasks_router)</code></pre>
+
+
+<h2 id="bloque-10">Bloque 10 — El modelo de tareas: el usuario es un entero, no una FK</h2>
+
+<p>El modelo de tareas muy sencillo: simplemente es un modelo base y lo que
+quieras colocar: el id, el usuario —fíjate que es simplemente un entero—,
+porque aquí, otra vez, él no sabe qué demonios es un usuario. Por lo tanto,
+aquí no podemos tener una relación de tipo FK, porque, otra vez, por
+convención, el usuario vive en otra aplicación, también su base de datos vive
+en esa aplicación, y aquí no se sabe absolutamente nada. Por lo demás, muy
+normal: título, status, y lo que tú quieras colocar por ahí.</p>
+
+<h3><code>task-service/app/models.py</code></h3>
+
+<pre><code>from datetime import UTC, datetime
+
+from sqlalchemy import DateTime, String, Text
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.db import Base
+
+STATUS_PENDING = "pending"
+STATUS_COMPLETED = "completed"
+STATUSES = (STATUS_PENDING, STATUS_COMPLETED)
+
+
+def utcnow() -&gt; datetime:
+    # Naive en UTC: sqlite no conserva tzinfo.
+    return datetime.now(UTC).replace(tzinfo=None)
+
+
+class Task(Base):
+    __tablename__ = "tasks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(index=True)
+    title: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(20), default=STATUS_PENDING)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)</code></pre>
+
+
+<h2 id="bloque-11">Bloque 11 — Los esquemas (Pydantic)</h2>
+
+<p>El esquema: nada raro. Simplemente, bueno, los de Pydantic te lo de siempre;
+y bueno, sería TaskUpdate y TaskCreate, los que vamos a manejar; el de salidas
+—para pintarlo por pantalla—, muy normal; y el del cliente. El
+<code>normalize_status</code> es la validación del status: fuera de
+<code>pending|completed</code>, un 422.</p>
+
+<h3><code>task-service/app/schemas.py</code></h3>
+
+<pre><code>from datetime import datetime
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from app.models import STATUSES
+
+
+class TaskCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    status: str | None = None
+
+
+class TaskUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    status: str | None = None
+
+
+class TaskOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    user_id: int
+    title: str
+    status: str
+    created_at: datetime
+    updated_at: datetime
+
+
+def normalize_status(value: str | None, default: str) -&gt; str:
+    if value is None:
+        return default
+    if value not in STATUSES:
+        from fastapi import HTTPException
+
+        raise HTTPException(
+            status_code=422,
+            detail=f"status debe ser uno de: {', '.join(STATUSES)}",
+        )
+    return value</code></pre>
+
+
+<h2 id="bloque-12">Bloque 12 — Las rutas: dueño de la tarea, 404 y 403</h2>
+
+<p>Vamos a dejar aquí el de rutas, donde se conecta todo. Obviamente, porque
+tenemos, por ejemplo, el task_id, para encontrar una tarea, y que obviamente yo
+sea el dueño, para no ver las tareas de otros usuarios; todo esto se realiza por
+aquí. Con el task_id buscamos; si existe la tarea, damos el 200; si es nula,
+entonces, a freír gatos: un 404; y si no eres dueño, pues no es tu tarea: un
+403.</p>
+
+<p>Y por aquí, como cosa interesante, tenemos el de <code>current_user</code>,
+que vamos a ver qué es. Por lo demás, es el mismo flujo para el resto de los
+endpoints: para crear, simplemente, otra vez, el usuario identificado —siempre
+tenemos esta dependencia, ya la vamos a ver—; creamos la tarea, insertamos en
+la base de datos. Como dependencia aquí también tenemos el <code>get_db</code>
+—por aquí lo puedes ver, ahí lo tienes como dependencia—. Al igual que el de
+obtener todas las tareas: simplemente es una petición para nuestra base de
+datos, con el query correspondiente, de obtener todas las tareas del usuario,
+obviamente con el current_user, aquí lo puedes ver. Al igual que obtener una
+tarea en particular, o para actualizarla, o eliminarla: es exactamente lo mismo
+que vemos en el curso básico o en el libro, así que no lo voy a indicar mucho
+más.</p>
+
+<h3><code>task-service/app/routes_tasks.py</code></h3>
+
+<pre><code>def find_owned(task_id: int, current_user: dict[str, Any], db: Session) -&gt; Task:
+    task = db.get(Task, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Tarea no encontrada")
+    if task.user_id != current_user["id"]:
+        # El 403 va antes que cualquier error interno: no existe para ti.
+        raise HTTPException(status_code=403, detail="No es tu tarea")
+    return task
+
+
+@router.post("/tasks", response_model=TaskOut, status_code=201)
+def create_task(
+    payload: TaskCreate,
+    current_user: dict[str, Any] = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -&gt; Task:
+    task = Task(
+        title=payload.title,
+        status=normalize_status(payload.status, STATUS_PENDING),
+        # El dueño lo pone el sistema: el cliente no manda user_id.
+        user_id=current_user["id"],
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+@router.get("/tasks", response_model=list[TaskOut])
+def list_tasks(
+    current_user: dict[str, Any] = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -&gt; list[Task]:
+    return list(
+        db.query(Task)
+        .filter(Task.user_id == current_user["id"])
+        .order_by(Task.id.desc())
+        .all()
+    )</code></pre>
+
+<p>(<code>show_task</code>, <code>update_task</code> y <code>delete_task</code>
+tienen la misma forma: siempre <code>Depends(get_current_user)</code> +
+<code>Depends(get_db)</code>, y <code>find_owned</code> al frente.)</p>
+
+<pre><code>@router.get("/tasks/{task_id}", response_model=TaskOut)
+def show_task(
+    task_id: int,
+    current_user: dict[str, Any] = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -&gt; Task:
+    return find_owned(task_id, current_user, db)</code></pre>
+
+
+<h2 id="bloque-13">Bloque 13 — deps.py: la credencial en la cabecera</h2>
+
+<p>Vamos con la parte del <code>current_user</code>; fíjate que aquí tenemos
+una parte más interesante. Aquí tenemos esto para la cabecera; recuerda que,
+por aquí —por ejemplo, esta sería la de usuarios—, cuando vamos a hacer una
+petición, tenemos que configurar lo que es la cabecera. Para tener aquí la
+parte de las credenciales: hay como cuatro formas —en la documentación
+automática—, pero esta es la que estoy utilizando, porque sí, porque patata.
+También, aquí la autenticación que estamos teniendo es muy básica; más adelante
+la vamos a mejorar con un JWT, pero de a poco.</p>
+
+<p>Entonces, ¿qué es lo que tenemos aquí? Recuerda que estamos todavía en la
+aplicación de tareas. Aquí obtenemos el token: las credenciales, pues otra vez,
+el token que colocamos aquí —de igual manera, después lo puedes ver en el curl,
+para saber exactamente cómo lo está pasando, o cómo lo tienes que pasar, desde,
+por ejemplo, una aplicación en Vue—. Aquí lo estoy imprimiendo para que lo
+veas.</p>
+
+<h3><code>task-service/app/deps.py</code></h3>
+
+<pre><code>from typing import Any
+
+from fastapi import Header, HTTPException
+
+from app.user_service_client import verify_token
+
+
+def get_current_user(
+    authorization: str | None = Header(default=None),
+) -&gt; dict[str, Any]:
+    parts = authorization.split(" ", 1) if authorization else []
+    if len(parts) != 2 or parts[0] != "Bearer" or not parts[1].strip():
+        # Header ausente o malformado: problema del cliente, se rechaza aquí
+        # sin llamar a la red.
+        raise HTTPException(status_code=401, detail="Token no presentado o malformado")
+    return verify_token(parts[1].strip())</code></pre>
+
+
+<h2 id="bloque-14">Bloque 14 — verify_token: la petición HTTP al user-service</h2>
+
+<p>Aquí tenemos uno llamado <code>verify_token</code>. Otra vez: seguimos aquí
+en tareas. Y fíjate aquí lo que estamos haciendo: una petición a la aplicación
+de usuarios. De momento no nos importa qué es lo que está haciendo, pero
+obviamente, por contexto, ya te lo puedes esperar: aquí tenemos la respuesta, y
+la respuesta —si todo va OK— es el usuario, que es lo que finalmente manejamos
+desde nuestra aplicación. Entonces, aquí puedes ver un poquito el sentido de
+que, por ejemplo, cuando estamos preguntando por el id y demás, es porque lo
+estamos obteniendo mediante una petición HTTP —a secas, el sistema más simple
+posible; lo «bueno», como HTTPS o firmas, viene después—. Por lo demás, es
+simplemente una petición HTTP que estamos haciendo. Como te digo, hay formas
+más eficientes —por ejemplo, al final haremos gRPC de la manera correcta—, pero
+de momento, así, sencillito, para que se entienda el ejercicio. Y aquí lo que
+yo quiero que entiendas es básicamente eso: un microservicio es eso,
+comunicarse, de cierta forma y con ciertos estándares, con otro servicio. Y aquí
+el problema que vamos a tener, sobre todo, es la latencia.</p>
+
+<p>Bueno, aquí son validaciones típicas: si se devuelve 200, entonces tenemos
+el usuario; y si no, bueno: token inválido o expirado. Y eso es todo lo que
+tenemos.</p>
+
+<h3><code>task-service/app/user_service_client.py</code></h3>
+
+<pre><code>def verify_token(token: str) -&gt; dict[str, Any]:
+    """¿Quién es este token? Toda la frontera de red vive en este archivo:
+    los demás módulos te mandan el dict del usuario como si fuera local."""
+    try:
+        resp = _http_get(
+            f"{config.USER_SERVICE_URL}/api/user",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    except (httpx2.ConnectError, httpx2.ConnectTimeout):
+        # Es un fallo de infraestructura, no de identidad: el cliente merece
+        # saber qué servicio falta y cómo levantarlo (503, no `401` genérico).
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "user-service no está en pie (se esperaba "
+                f"{config.USER_SERVICE_URL}); levántalo con "
+                "`uv run uvicorn app.main:app --port 8000` en user-service/"
+            ),
+        )
+
+    if resp.status_code == 200:
+        user = resp.json()
+        # El cliente del IdP devuelve {id, name, email}; nada más entra aquí.
+        return {"id": int(user["id"]), "name": str(user["name"]), "email": str(user["email"])}
+
+    if resp.status_code == 401:
+        # La distinción que importa: `401` NO es un fallo del servicio, es
+        # identidad inválida del token presentado.
+        raise HTTPException(status_code=401, detail="Token inválido o expirado")
+
+    raise HTTPException(
+        status_code=502,
+        detail=f"Respuesta inesperada del user-service (HTTP {resp.status_code})",
+    )</code></pre>
+
+<p>(Este es el cliente con el timeout del bloque 7:
+<code>httpx2.Client(timeout=config.HTTP_TIMEOUT_SECONDS)</code>; si la petición
+tarda más de dos segundos, se desecha.)</p>
+
+
+<h2 id="bloque-15">Bloque 15 — deps ↔ user_service_client: modularidad</h2>
+
+<p>Aquí lo que te recomiendo es: copia el nombre de la función y, con
+Ctrl+Shift+F, busca; y por aquí puedes ver exactamente dónde se está
+referenciando. En este caso, el de deps es el que llama a todo lo que acabaste
+de ver, de la conexión con el servicio de la autenticación y demás. Otra vez,
+aquí puedes ver, por ejemplo, <code>verify_token</code>, dónde se utiliza: se
+está utilizando desde <code>user_service_client</code>, que lo tenemos por aquí.
+Entonces, el de deps lo que hace es llamar a este módulo; es así de simple, para
+tener todo un poco más modular. Así que, como te digo, estudia un poquito esto,
+pero a la final lo que hacemos es resolver un usuario que vive en otra
+aplicación.</p>
+
+
+<h2 id="bloque-16">Bloque 16 — user-service: la semilla y security (hash y token)</h2>
+
+<p>Y el de usuarios es mucho más sencillo. Simplemente venimos aquí —otra vez,
+el de auth; ¿ves? Lo que pasa es que comienza al revés—. Bueno: aquí tenemos una
+semilla para crear un usuario de prueba; el de security sería para la parte del
+hash y demás, lo típico. Aquí estamos manejando un hash que no tiene ningún tipo
+de significado —ni naming ni nada por el estilo—. ¿Qué queremos con esto? El
+token: verificamos el usuario, muy normal; obtenemos el password en texto
+plano, lo verificamos con el hash que está en la base de datos, y pues nada: si
+son iguales, perfectos. Y aquí convertimos el hash: utilizamos la siguiente
+función, lo codificamos, y eso es lo que estamos devolviendo. Hay muchas formas
+de hacer esto, así que no le des muchas vueltas.</p>
+
+<p>Por cierto: todo esto lo hice con inteligencia artificial, en base a algunas
+peticiones; lo fui iterando y te lo estoy presentando. Bueno: si todo esto
+devuelve el token, son funciones utilitarias, obviamente, para manipular el
+token —esto sería para comparar el token: el hash_token—; son funciones de ese
+tipo. Así que ya creo que se entiende un poquito ahí.</p>
+
+<h3><code>user-service/app/seed.py</code></h3>
+
+<pre><code>"""Usuarios demo de la primera parte (los mismos de la serie Laravel):
+
+    uv run python -m app.seed
+"""
+
+from sqlalchemy.orm import Session
+
+from app import security
+from app.db import Base, engine, SessionLocal
+from app.models import User
+
+DEMO_USERS = [
+    {"name": "Ana Torres", "email": "ana.torres@example.com", "password": "password"},
+    {"name": "Luis Ramirez", "email": "luis.ramirez@example.com", "password": "password"},
+]
+
+
+def run() -&gt; None:
+    Base.metadata.create_all(engine)
+    db: Session = SessionLocal()
+    try:
+        for spec in DEMO_USERS:
+            exists = db.query(User).filter(User.email == spec["email"]).first()
+            if exists:
+                continue
+            db.add(
+                User(
+                    name=spec["name"],
+                    email=spec["email"],
+                    password=security.hash_password(spec["password"]),
+                )
+            )
+        db.commit()
+        users = db.query(User).count()
+        print(f"{users} usuario(s) en la base de datos")
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+
+<h3><code>user-service/app/security.py</code></h3>
+
+<pre><code>import hashlib
+import hmac
+import secrets
+from datetime import UTC, datetime, timedelta
+
+
+def hash_password(password: str) -&gt; str:
+    # PBKDF2 de la biblioteca estándar: sin dependencias, determinista.
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100_000).hex()
+    return f"pbkdf2_sha256$100000${salt}${digest}"
+
+
+def verify_password(password: str, stored: str) -&gt; bool:
+    try:
+        _algo, _iters, salt, digest = stored.split("$")
+    except ValueError:
+        return False
+    candidate = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100_000).hex()
+    # Comparación en tiempo constante: nunca `==` directo.
+    return hmac.compare_digest(candidate, digest)
+
+
+def issue_token() -&gt; tuple[str, str]:
+    """Devuelve (token crudo, hash para guardar). El crudo viaja una sola vez."""
+    token = secrets.token_hex(32)
+    return token, hashlib.sha256(token.encode()).hexdigest()
+
+
+def hash_token(token: str) -&gt; str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def expiry(now: datetime | None = None) -&gt; datetime:
+    from app import config
+
+    # Naive UTC para la columna; el route lo vuelve aware al responder.
+    return (now or models_now_naive()) + timedelta(minutes=config.TOKEN_TTL_MINUTES)</code></pre>
+
+
+<h2 id="bloque-17">Bloque 17 — Los esquemas de usuarios</h2>
+
+<p>Ahí, el esquema… volvemos aquí… por seguridad: el esquema que tenemos, muy
+normal, para el token y el usuario, que son los modelos de Pydantic.</p>
+
+<h3><code>user-service/app/schemas.py</code></h3>
+
+<pre><code>from datetime import datetime
+
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
+
+
+class TokenRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=1)
+    device_name: str | None = Field(default="api-token", max_length=100)
+
+
+class UserInfo(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    email: EmailStr
+
+
+class TokenIssued(BaseModel):
+    token: str
+    token_type: str
+    expires_at: datetime
+    user: UserInfo</code></pre>
+
+
+<h2 id="bloque-18">Bloque 18 — El modelo de usuarios y el token (FK, hash, caducidad)</h2>
+
+<p>Y el modelo, lo típico: el usuario, y un modelo completamente personalizado
+por nosotros, sin ningún estándar ni nada por el estilo: el usuario, el hash del
+token, el nombre y fechas de expiración y creación. Y el user_id, claro está: en
+este caso es de tipo relacional, para tener la FK en la BD. Nuevamente, aquí
+tenemos una base de datos completamente independiente.</p>
+
+<h3><code>user-service/app/models.py</code></h3>
+
+<pre><code>from datetime import UTC, datetime
+
+from sqlalchemy import DateTime, ForeignKey, String
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.db import Base
+
+
+def utcnow() -&gt; datetime:
+    # Naive en UTC: sqlite no conserva tzinfo; toda la BD vive en UTC-naive.
+    return datetime.now(UTC).replace(tzinfo=None)
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    password: Mapped[str] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class ApiToken(Base):
+    __tablename__ = "api_tokens"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    # Token opaco: se guarda solo el hash, el crudo sale una vez del login.
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(100), default="api-token")
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    user: Mapped[User] = relationship(User)</code></pre>
+
+
+<h2 id="bloque-19">Bloque 19 — La BD, la configuración y el main de usuarios</h2>
+
+<p>Nuevamente, aquí tienes la base de datos: la misma conexión que antes; de
+aquí no cambia nada. Las configuraciones: un poco lo mismo —esto sería la
+duración del token, cuánto queremos que dure, que sería una hora—. Y en el main
+tenemos, para arrancar la aplicación: se crean los modelos, las rutas…</p>
+
+<h3><code>user-service/app/db.py</code> (idéntico en la forma al de task-service)</h3>
+
+<pre><code>from sqlalchemy import create_engine
+from sqlalchemy.orm import DeclarativeBase, sessionmaker
+
+from app import config
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+def _make_engine(url: str) -&gt; "create_engine":  # type: ignore[valid-type]
+    kwargs = {"connect_args": {"check_same_thread": False}}
+    if url.endswith("//:memory:"):
+        from sqlalchemy.pool import StaticPool
+
+        kwargs["poolclass"] = StaticPool
+    return create_engine(url, **kwargs)
+
+
+engine = _make_engine(config.DATABASE_URL)
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()</code></pre>
+
+<h3><code>user-service/app/config.py</code> (estado del capítulo 1)</h3>
+
+<pre><code>import os
+
+
+def _int(name: str, default: int) -&gt; int:
+    return int(os.environ.get(name, str(default)))
+
+
+# Duración de vida del token opaco (capítulo 1: caducidad, 60 min).
+TOKEN_TTL_MINUTES = _int("TOKEN_TTL_MINUTES", 60)
+TOKEN_TTL_SECONDS = TOKEN_TTL_MINUTES * 60
+
+# sqlite de este servicio; en tests, DATABASE_URL=sqlite:///:memory:
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///database.sqlite")</code></pre>
+
+<h3><code>user-service/app/main.py</code> (estado del capítulo 1)</h3>
+
+<pre><code>from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+
+from app.db import Base, engine
+from app.routes_tokens import router as tokens_router
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    Base.metadata.create_all(engine)
+    yield
+
+
+app = FastAPI(
+    title="user-service",
+    description="IdP de la serie: tokens opacos que caducan (capítulo 1).",
+    version="0.1.0",
+    lifespan=lifespan,
+)
+app.include_router(tokens_router)</code></pre>
+
+
+<h2 id="bloque-20">Bloque 20 — Las rutas del IdP: login, /user y revocar</h2>
+
+<p>Y las rutas: obtener el usuario; eliminar el token —que sería otra vez la
+conexión a la base de datos: obtener el token de autorización, que se lo tenemos
+que pasar, y pues nada, lo eliminamos; bueno, en este caso lo hacemos aquí
+localmente—. Y el login: verificamos el usuario, muy normal; obtenemos el
+password en texto plano, lo verificamos con el hash en la base de datos; si son
+iguales, perfecto. Y el token: el crudo se devuelve una sola vez —a la base de
+datos llega solo su hash—. El authenticate, que es lo que usan
+<code>/api/user</code> y el DELETE, busca el hash del token en la BD y comprueba
+que no haya caducado.</p>
+
+<h3><code>user-service/app/routes_tokens.py</code> (estado del capítulo 1)</h3>
+
+<pre><code>@router.post("/tokens", response_model=TokenIssued, status_code=201)
+def issue_token(
+    payload: TokenRequest,
+    db: Session = Depends(get_db),
+) -&gt; TokenIssued:
+    """Inicio de sesión, una vez: email + contraseña → token opaco que caduca."""
+    user = db.query(User).filter(User.email == payload.email).first()
+
+    # Mismo mensaje y mismo status para "no existe" y "contraseña mala": si no,
+    # esta respuesta sirve para enumerar qué emails están dados de alta.
+    if user is None or not security.verify_password(payload.password, user.password):
+        raise HTTPException(status_code=401, detail="Credenciales inválidas")
+
+    token, token_hash = security.issue_token()
+    expires_at = security.expiry()
+    row = ApiToken(
+        user_id=user.id,
+        token_hash=token_hash,
+        name=payload.device_name or "api-token",
+        expires_at=expires_at,
+    )
+    db.add(row)
+    db.commit()
+
+    return TokenIssued(
+        token=token,
+        token_type="Bearer",
+        expires_at=expires_at.replace(tzinfo=UTC),
+        user=UserInfo.model_validate(user),
+    )
+
+
+@router.get("/user", response_model=UserInfo)
+def whoami(user: User = Depends(require_user)) -&gt; UserInfo:
+    return UserInfo.model_validate(user)
+
+
+@router.delete("/tokens", status_code=204)
+def revoke(
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+) -&gt; None:
+    """Revoca el token con el que se hizo el request: borrar la fila es una
+    revocación real e inmediata (el trade-off del token opaco)."""
+    from app.auth import authenticate
+
+    user, row = authenticate(db, authorization)
+    db.query(ApiToken).filter(ApiToken.id == row.id).delete()
+    db.commit()</code></pre>
+
+<h3><code>user-service/app/auth.py</code></h3>
+
+<pre><code>def authenticate(db: Session, authorization: str | None) -&gt; tuple[User, ApiToken]:
+    """¿Quién es este token? La respuesta es `401` ante token inválido o expirado."""
+    token = _bearer_token(authorization)
+    if token is None:
+        raise HTTPException(status_code=401, detail="Token no presentado o malformado")
+
+    row = db.query(ApiToken).filter(ApiToken.token_hash == security.hash_token(token)).first()
+    if row is None:
+        raise HTTPException(status_code=401, detail="Token inválido o expirado")
+
+    # Token caducado: para el cliente es idéntico a uno inexistente.
+    if row.expires_at &lt;= utcnow():
+        raise HTTPException(status_code=401, detail="Token inválido o expirado")
+
+    return row.user, row</code></pre>
+
+
+<h2 id="bloque-21">Bloque 21 — Métodos internos y pruebas unitarias</h2>
+
+<p>Bueno, como te digo, estos métodos son empleados internamente; ya todo ello
+lo puedes buscar aquí. Y puedes ver que, por ejemplo, con los fixtures —que es
+para generar los datos, para generar el usuario de pruebas—, aquí lo estamos
+utilizando, porque no tengo un método de registro, entonces lo generé por ahí.
+Pero son métodos muy sencillos. También tenemos pruebas unitarias, que las pasé
+por encima para no alargar esto de más: 11 en el task-service y 7 en el
+user-service (en la etiqueta <code>0.1</code>).</p>
+
+
+<h2 id="bloque-22">Bloque 22 — Las dos conclusiones y la definición de microservicio</h2>
+
+<p>Así que lo que quiero que te quede, en este punto, son dos cosas. Una: aquí,
+simplemente, en la aplicación de usuarios manejamos usuarios, y en la de tareas,
+tareas. Pero, por lógica de negocio, tenemos que conectarlas, y para eso
+utilizamos conexiones HTTP, de momento, para conectar ambas aplicaciones. Y eso
+es simplemente eso.</p>
+
+<p>Y por la temática, o el cómo están conformadas ambas aplicaciones —ambos
+servicios—, ya los convierte en una arquitectura de microservicios, ya que
+sería lo mínimo necesario para que puedan funcionar y estén conectadas. Y así,
+un poquito, la definición de microservicio que no le he dado hasta este punto:
+es simplemente un estilo de arquitectura —de desarrollo de software— en el cual
+una aplicación completa, que es lo que tenemos aquí —una aplicación de tareas
+con usuario identificado—, se divide en pequeños servicios independientes y
+autónomos. Esto de «autónomos» es importante, porque cuando se cae una —por
+ejemplo, el usuario—, la de tareas, por más que sea, debería poder hacer algo;
+ahorita no va a hacer ni media papa, por lo tanto, porque la respuesta HTTP
+nunca la va a devolver, y por lo tanto la de tareas siempre va a rechazar las
+peticiones. Pero vamos a eso.</p>
+
+<p>Entonces, cada uno de estos servicios cumple una función específica de
+negocio, lo comentado desde el inicio: por eso tenemos el de usuario —gestión
+de usuarios— y también la parte de tareas; en nuestro caso, tareas. Pero
+obviamente podemos anexar más microservicios, y a la final, eso es, como quien
+dice, lo bonito de la teoría —como el socialismo: muy bonita—, pero la práctica
+es un desastre, en la cual tenemos una aplicación que hace determinadas
+cosas… y lo comentado antes: ya puedes ver que la cosa se va a ir enredando
+bastante, porque esas conexiones son bastante necesarias. Por lo tanto, a la
+final, el problema que tenemos con los microservicios, conforme vamos
+avanzando, es más que nada la conexión: nos estamos preocupando más en
+mantener la arquitectura de microservicios que en implementar la aplicación en
+sí, la lógica de negocio y lo demás, que es lo que el usuario necesita.</p>
+
+
+<h2 id="bloque-23">Bloque 23 — La presentación: repaso y el flujo completo</h2>
+
+<p>Ya para terminar, vamos un poquito a la práctica, para que veas qué es lo
+que tenemos. Aquí, bueno, aquí tenemos esta presentación, que también la tienes
+en la parte de docs (<code>docs/01-estructura-base.html</code>), para que la
+veas un poquito. Antes de la demostración: estructura base, para que sepas
+exactamente qué es lo que tenemos; vamos a hacer un pequeño repaso.</p>
+
+<p>Entonces, aquí tenemos dos servicios que no se conocen, un poco lo comentado
+de inicio: tareas y usuarios. Entonces, la pregunta es: sin microservicios —por
+ejemplo, para obtener las tareas de los usuarios, desde el modelo lo hubiéramos
+tenido—, recuerda lo que te mostré antes en la parte de models de tareas: aquí
+tuviéramos una relación FK, y pudiéramos hacer un join y sacado del asunto.
+Pero aquí, como somos… estamos empleando microservicios, la cosa cambia, y por
+lo tanto tenemos que utilizar el esquema que te presentaba hace unos momentos.</p>
+
+<p>El asunto funciona un poquito así: hacemos un curl —en este caso estamos
+empleando la documentación automática— a <code>/api/tasks</code>, que a su vez
+tiene, como lo puedes suponer, los endpoints. Cada uno tiene que resolver quién
+demonios es el usuario, mediante la dependencia que llevan implícitamente: cada
+uno de los endpoints —vuelvo a recordarlo— lleva el <code>Depends</code> con el
+<code>current_user</code>. Y por lo tanto, una vez que tiene este token, y se
+devuelve un 200 —porque si no, a freír gatos—, es que puedes hacer la
+operación; y si no, bueno, la cosa quedó ahí. Por lo tanto, este es el flujo
+nuevo que tenemos. Y aquí un poco lo comentado: si no eres dueño de la tarea,
+si el servicio no devuelve el usuario, si hay un error, si expiró, lo que sea,
+ya no hace nada. Entonces: inicias sesión una vez, y ya puedes utilizar toda la
+aplicación. En este caso solamente tenemos el detalle de tareas —para el resto
+me da absolutamente igual; es el ejercicio que utilicé—. Y bueno: cada request,
+básicamente, está haciendo una petición al user-service, con todos los
+problemas que nos trae en infraestructura. Porque otra vez: ¿qué pasa? Tenemos
+mil usuarios concurrentes y empiezan a darle, todo el mundo, al user-service…
+y podemos tener problemas. Y aparte, la carga también termina cayendo sobre el
+de tareas.</p>
+
+
+<h2 id="bloque-24">Bloque 24 — Lógica de negocio fuera de lugar, y el token</h2>
+
+<p>Bueno: tenemos el método para verificar el token, tal cual te lo presentaba
+antes, en la de tareas. Aquí fíjate: por más que sea, se tiene cierta lógica de
+negocio que no es per se de la tarea, como viene siendo la parte de verificar
+el token, en el módulo de tareas; cosa que a la final es un problema, porque
+¿qué pasa cuando queremos agregar un tercer microservicio, también para
+gestionar algo? Por ejemplo, en este caso va a ser un billing de cuentas:
+¿copiar y pegar este código? Entonces ahí ya tenemos que empezar a ver cómo
+podemos hacer estos acomodos, pero bueno, eso es otro tema.</p>
+
+<p>Y el token: pues nada, expira en 60 minutos, no puede ser nulo. Realmente,
+el token no vale absolutamente nada desde el lado de tareas, ya que el que
+puede verificar ese token es simplemente el de usuarios. Cosa que más adelante
+lo vamos a mejorar con JWT —donde ellos mismos se pueden, por decirlo así,
+auto-verificar—, pero eso lo veremos más adelante.</p>
+
+
+<h2 id="bloque-25">Bloque 25 — DEMO: sin token, un bonito 401</h2>
+
+<p>Y bueno, esto ya no importa mucho, y eso es lo más importante. Entonces,
+ahora sí, vamos un poquito a la demo. Aquí, un poco lo comentado, ya puedes ver
+un poco cómo funciona. Aquí no estoy autenticado; si intento, por ejemplo,
+obtener una tarea —puedo darle aquí a «Try it out», voy a darle a ejecutar—:
+adivinaste, es un bonito 401, porque no estoy autenticado.</p>
+
+<h3>Respuesta real del proyecto (<code>GET /api/tasks</code> sin cabecera)</h3>
+
+<pre><code>{ "detail": "Token no presentado o malformado" }</code></pre>
+
+<p>(Es el 401 de <code>deps.py</code> del bloque 13: sin llegar a llamar a la
+red.)</p>
+
+
+<h2 id="bloque-26">Bloque 26 — DEMO: iniciar sesión en el user-service</h2>
+
+<p>Por lo tanto, tenemos que venir aquí, al de usuarios. Obviamente, esto,
+desde una aplicación —por ejemplo, en Vue—, lo consumimos todo y lo hacemos
+transparente para el usuario; pero de momento tenemos esto. Entonces, aquí
+utilizaríamos el POST para crear un token. El usuario: aquí lo puedes ver en el
+user-service —cuál es el que creé, o te creas uno—, que sería por aquí, en el
+seed: <code>ana.torres@example.com</code>; voy a colocarlo aquí —debería
+colocarlo ya en el ejemplo, pero de repente lo hago más adelante—. Y el
+password: password. Y el device_name: no le hagas caso. Vamos a ejecutar, y aquí
+tenemos nuestro bonito token, justamente este. Lo copiamos; tiene que ir
+acompañado del Bearer, la cabecera HTTP que estamos empleando.</p>
+
+<p>Regresamos al de tareas, nos autenticamos, colocamos aquí «Bearer espacio el
+token», autorizamos, cerramos y ejecutamos. — A mí me recolocó dos veces
+«Bearer», por eso no hace falta colocarlo; voy a quitarlo, para darle logout,
+voy a colocar el valor nada más, autorizamos, cerramos, ejecutamos…— y ahora
+sí, lo tenemos.</p>
+
+<h3><code>POST http://127.0.0.1:8000/api/tokens</code> (equivalente curl, del README)</h3>
+
+<pre><code>curl -X POST http://127.0.0.1:8000/api/tokens \
+  -H 'Content-Type: application/json' \
+  -d '{"email": "ana.torres@example.com", "password": "password"}'</code></pre>
+
+<h3>Respuesta 201 del proyecto</h3>
+
+<pre><code>{
+  "token": "…64 caracteres hex…",
+  "token_type": "Bearer",
+  "expires_at": "2026-11-11T12:34:56Z",
+  "user": { "id": 1, "name": "Ana Torres", "email": "ana.torres@example.com" }
+}</code></pre>
+
+
+<h2 id="bloque-27">Bloque 27 — DEMO: crear y listar tareas</h2>
+
+<p>Bueno, siempre pendiente: aquí, como te digo, obviamente puedes ver la
+petición curl, y tú lo puedes hacer desde tu terminal o desde cualquier otra
+aplicación. Y aquí lo tenemos, perfecto.</p>
+
+<p>Entonces vamos a probar rapidito el de crear: aquí tendríamos que hacer lo
+mismo… bueno, aquí ya estoy autenticado, creo. Vamos a probarlo: «Try it out»,
+darle un title, y el status sería alguno de estos: pending. Vamos a ejecutar;
+aquí tenemos la respuesta. Y si vuelvo al de aquí arriba y ejecutamos, aquí
+deberíamos de ver que lo que hace este <code>/api/tasks</code>: deberíamos ver
+las tareas que están… bueno, dos tareas… no sé qué pasó con las otras, de ser
+de otro usuario. Aquí las tenemos, tal cual puedes ver, y eso es así de simple:
+nuestra aplicación.</p>
+
+<h3>Equivalente curl (del README)</h3>
+
+<pre><code># crear tarea (el dueño lo pone el sistema, no el payload, aunque lo mandes)
+curl -X POST http://127.0.0.1:8001/api/tasks \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"title": "Comprar pan"}'</code></pre>
+
+
+<h2 id="bloque-28">Bloque 28 — DEMO: ¿y si el user-service se muere? (503)</h2>
+
+<p>¿Y qué pasa si el user-service se muere? Aquí lo voy a detener. Vuelvo aquí,
+ejecuto: 503. Porque, lo puedes suponer, lo que puedes ver: el user-service no
+está en pie. Desgraciadamente, la aplicación no sirve; llamen al técnico. Y aquí
+puedes ver que parte de la validación que se hace, justamente por acá: si
+tenemos una respuesta de conexión, o directamente un ConnectionError —que sería
+justamente lo que está sucediendo ahorita—, entonces generamos una excepción de
+tipo personalizada por nosotros, y decimos que el user-service no está en pie:
+que se fue de parranda; por lo tanto, pues nada, hay que solucionarlo. Y esto
+son los problemas que también tenemos en los microservicios. Como te digo,
+esto está a lo mínimo, pero básicamente esa es la idea.</p>
+
+<h3><code>task-service/app/user_service_client.py</code> (el 503)</h3>
+
+<pre><code>    except (httpx2.ConnectError, httpx2.ConnectTimeout):
+        # Es un fallo de infraestructura, no de identidad: el cliente merece
+        # saber qué servicio falta y cómo levantarlo (503, no `401` genérico).
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "user-service no está en pie (se esperaba "
+                f"{config.USER_SERVICE_URL}); levántalo con "
+                "`uv run uvicorn app.main:app --port 8000` en user-service/"
+            ),
+        )</code></pre>
+
+<h3>Respuesta real del proyecto</h3>
+
+<pre><code>{ "detail": "user-service no está en pie (se esperaba http://127.0.0.1:8000); levántalo con `uv run uvicorn app.main:app --port 8000` en user-service/" }</code></pre>
+
+<div>
+<p><strong>Ojo para el doblaje/edición:</strong> en la transcripción del vídeo
+se menciona «error 500», pero el status real del proyecto (y lo que muestra
+Swagger en la demo) es <strong>503</strong> con este mensaje. Verificar qué dice
+la grabación al montar.</p>
+</div>
+
+
+<h2 id="bloque-29">Bloque 29 — Cierre: etiqueta 0.1 y siguiente clase</h2>
+
+<p>Así que pues nada: el código fuente lo tienes en la descripción de esta
+publicación, en el libro, en el curso; igual donde me estás viendo, ahí tienes
+el código fuente asociado a la primera clase, que justamente es esta del vídeo,
+para que lo puedas ir probando. Por lo demás, en el repositorio lo que te
+recomiendo es que descargues la etiqueta; búscate la etiqueta, que en este caso
+sería <code>0.1</code>, y así va a ser para cada uno de los vídeos: cada uno va
+a tener una etiqueta asociada, por lo tanto puedes trabajar con exactamente el
+código fuente que estamos tratando en dicha clase. Y pues nada, en este caso
+sería esto; para el siguiente sería el <code>0.2</code>, y para el tercer
+vídeo, la tercera clase, sería el <code>0.3</code>, y así hasta el infinito,
+hasta que me aburra, o lo que suceda primero. Así que, ahora sí, vamos a la
+siguiente clase.</p>
+
+<hr>
+
+<footer>
+<p><em>Nota:</em> guion de trabajo del vídeo 1 de la serie FastAPI (etiqueta
+<code>0.1</code> del repositorio). El doc público del capítulo, para el blog, es
+<code>docs/01-estructura-base.html</code>; este archivo solo empareja la
+narración de la grabación con los fragmentos exactos de código.</p>
+</footer>
+
+</article>
+
+</body>
+</html>

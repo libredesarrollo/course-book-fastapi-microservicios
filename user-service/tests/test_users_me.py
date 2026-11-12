@@ -1,7 +1,6 @@
 from datetime import timedelta
 
 from tests.conftest import client, seed_two_users
-import tests.conftest as conftest
 
 
 def _login(c):
@@ -37,8 +36,7 @@ def test_token_expirado_es_401_como_cualquier_otro():
 
     with client() as c:
         token = _login(c)["token"]
-        # Un token existente, pero en el pasado ya venció.
-        conftest.SessionLocal  # espacio de importación
+        # Un token existente, pero que ya venció.
         from app.db import SessionLocal
         from app.models import ApiToken, utcnow
 

@@ -29,8 +29,7 @@ def create_task(
     task = Task(
         title=payload.title,
         status=normalize_status(payload.status, STATUS_PENDING),
-        # El dueño lo pone el sistema, el cliente no lo manda (Miguel no
-        # confiando en el payload: user_id de la identidad validada).
+        # El dueño lo pone el sistema: el cliente no manda user_id.
         user_id=current_user["id"],
     )
     db.add(task)

@@ -1,0 +1,955 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>Autenticación entre microservicios FastAPI: flujo completo</title>
+
+<meta name="description" content="Cómo autenticar un token entre dos microservicios FastAPI sin base de datos compartida: flujo, código, errores reales y el precio en latencia.">
+<meta name="keywords" content="autenticación microservicios FastAPI, token API FastAPI, auth entre servicios, opaco vs JWT, user_service_client, dependencias FastAPI, microservicios sin base de datos compartida">
+<meta name="author" content="desarrollolibre.net">
+<meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1">
+<meta name="theme-color" content="#0969da">
+
+<meta property="og:type" content="article">
+<meta property="og:locale" content="es_ES">
+<meta property="og:site_name" content="desarrollolibre.net">
+<meta property="og:title" content="Autenticación entre microservicios FastAPI: flujo completo">
+<meta property="og:description" content="Cómo autenticar un token entre dos microservicios FastAPI sin base de datos compartida: flujo, código, errores reales y el precio en latencia.">
+
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Autenticación entre microservicios FastAPI: flujo completo">
+<meta name="twitter:description" content="Flujo, código, errores reales y el precio en latencia de validar tokens por HTTP.">
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "TechArticle",
+  "headline": "Autenticación entre microservicios FastAPI: flujo completo",
+  "description": "Cómo autenticar un token entre dos microservicios FastAPI sin base de datos compartida: flujo, código, errores reales y el precio en latencia.",
+  "inLanguage": "es",
+  "datePublished": "2026-11-11",
+  "dateModified": "2026-11-11",
+  "proficiencyLevel": "Intermediate",
+  "articleSection": "FastAPI",
+  "keywords": "autenticación, microservicios, FastAPI, token API, JWT, dependencias",
+  "isAccessibleForFree": true,
+  "publisher": { "@type": "Organization", "name": "desarrollolibre.net" }
+}
+</script>
+
+</head>
+<body>
+
+<article>
+
+<header>
+<h1>Autenticación entre microservicios FastAPI: flujo completo</h1>
+
+<p><strong>Resumen:</strong> cuando dos servicios no comparten base de datos, el que quiere proteger un recurso no puede validar por su cuenta quién está llamando. La solución más simple y la más honesta es que le pregunte al servicio dueño de la identidad por HTTP. Este artículo implementa exactamente eso con FastAPI, muestra el código completo, y explica lo que cuesta.</p>
+
+<p>Lo construimos sobre un proyecto real de dos servicios: <strong>user-service</strong> (dueño de los usuarios, autenticador) y <strong>task-service</strong> (dueño de las tareas). Cada uno con su base de datos sqlite, sin llaves foráneas cruzadas, hablando solo por HTTP. Cada servicio es un proyecto <code>uv</code> independiente, con su propio <code>pyproject.toml</code> y su propio <code>.venv</code>.</p>
+</header>
+
+<nav>
+<h2>Contenido</h2>
+<ol>
+<li><a href="#problema">El problema que resuelve la autenticación</a></li>
+<li><a href="#decidir">La decisión: validar por HTTP o token stateless</a></li>
+<li><a href="#flujo">El flujo, paso a paso</a></li>
+<li><a href="#tabla-tokens">La tabla api_tokens (solo hashes)</a></li>
+<li><a href="#middleware">La dependencia del task-service</a></li>
+<li><a href="#propiedad">De dónde sale el user_id, y por qué ya no se valida</a></li>
+<li><a href="#ui">¿Y la sesión web?</a></li>
+<li><a href="#errores">Cuatro errores reales que aparecieron</a></li>
+<li><a href="#matriz">Matriz de respuestas</a></li>
+<li><a href="#verificar">Verificarlo con cURL</a></li>
+<li><a href="#precio">El precio: latencia y disponibilidad</a></li>
+<li><a href="#alternativas">Las alternativas y cuándo tienen sentido</a></li>
+<li><a href="#tercer-servicio">¿Y si hay un tercer microservicio?</a></li>
+<li><a href="#libreria-compartida">Un paquete con código reutilizable</a></li>
+<li><a href="#limitaciones">Limitaciones honestas</a></li>
+</ol>
+</nav>
+
+<hr>
+
+
+<h2 id="problema">1. El problema que resuelve la autenticación</h2>
+
+<p>Antes de añadir autenticación, el flujo era "abierto": cualquiera podía crear, editar y borrar cualquier tarea.</p>
+
+<pre><code>$ curl -X POST http://127.0.0.1:8001/api/tasks \
+    -H "Content-Type: application/json" \
+    -d '{"title":"Tarea maliciosa","user_id":42}'
+
+201 Created   # sin preguntar quién eres</code></pre>
+
+<p>Y más grave: <strong>el user_id venía en el cuerpo del request</strong>. Una validación por HTTP al user-service solo comprobaría que ese usuario existiera, no que quien llamara fuera ese usuario. Cualquiera podía crear una tarea "de Ana Torres" sin ser Ana.</p>
+
+<p>Eso significa que la validación hace la mitad del trabajo, y la mitad que falta es la importante. La autenticación cierra ese hueco: el user_id deja de ser un dato que el cliente afirma y pasa a ser una identidad que el sistema resuelve.</p>
+
+<h3>El punto de partida</h3>
+
+<pre><code># LA FORMA SIN AUTH: el cliente dice quién es, y hay que ir a comprobar que existe
+user_id = payload["user_id"]
+
+if find_user(user_id) is None:
+    raise HTTPException(422, "El usuario no existe en el sistema")
+
+task = Task(title=payload["title"], user_id=user_id)</code></pre>
+
+<div>
+<p><strong>El bug de fondo:</strong> una validación de existencia no es una autorización. La primera responde "¿este id corresponde a alguien?", la segunda responde "¿tienes derecho a actuar en nombre de ese alguien?". Son preguntas distintas, y esta implementación solo haría la primera. En este proyecto esa versión nunca llegó a existir: el sistema se construyó ya con la lección aprendida de la serie hermana en Laravel, que sí vivió ese bug.</p>
+</div>
+
+
+<h2 id="decidir">2. La decisión: validar por HTTP o token stateless</h2>
+
+<p>El task-service necesita saber quién llama. Pero la tabla de usuarios y de tokens vive en el user-service. Hay dos caminos, y no son equivalentes.</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th></th><th>Validar por HTTP (lo que hicimos)</th><th>Token stateless (JWT)</th></tr>
+<tr>
+<td><strong>Dónde se valida</strong></td>
+<td>El task-service reenvía el token al user-service</td>
+<td>El task-service verifica la firma en local, sin llamar a nadie</td>
+</tr>
+<tr>
+<td><strong>Latencia por request</strong></td>
+<td>+1 salto de red (~2 ms en local, medido)</td>
+<td>0 saltos</td>
+</tr>
+<tr>
+<td><strong>Si el user-service cae</strong></td>
+<td>Nadie puede autenticarse: 503 en todo</td>
+<td>La API sigue funcionando con normalidad</td>
+</tr>
+<tr>
+<td><strong>Revocar un token</strong></td>
+<td>Trivial: borrar la fila</td>
+<td>Difícil: el token es válido hasta que expira</td>
+</tr>
+<tr>
+<td><strong>Escalado</strong></td>
+<td>Cada réplica del user-service recibe carga extra</td>
+<td>Totalmente horizontal</td>
+</tr>
+</table>
+
+<p><strong>Elegimos validar por HTTP.</strong> Es el diseño arquitectónicamente correcto: el estado de identidad tiene un único dueño y nadie lo replica. El costo es explícito y, sobre todo, demostrable en cinco segundos apagando un servicio.</p>
+
+<p>El downside lo conocemos antes de escribir el código: es exactamente lo que un JWT viene a evitar. Lo dejamos así a propósito, y más abajo comparamos las opciones con sus números.</p>
+
+
+<h2 id="flujo">3. El flujo, paso a paso</h2>
+
+<pre>
+  LOGIN (una vez)
+
+  Cliente ──POST /api/tokens──▶ user-service ──▶ SELECT en users
+      │         {email,           │                INSERT en api_tokens
+      │          password}        │◀── token en claro (una sola vez)
+      │◀────── 201 + token ───────┘
+
+  CADA REQUEST POSTERIOR
+
+  Cliente ──GET /api/tasks──▶ task-service ──GET /api/user──▶ user-service
+      │                        dependencia                      SELECT por
+      │                            │                             hash sha256
+      │                            │◀──── {id, name, email} ─────┘
+      │                            │
+      │                            ▼  "¿quién es este token?"
+      │                        dict del usuario
+      │                            │
+      │                            ▼
+      │                        db_tasks (user_id = identidad, no input)
+      │◀───── 200 / 201 / 401 / 403 ─┘
+</pre>
+
+<ol>
+<li>El cliente manda email y contraseña al user-service.</li>
+<li>El user-service verifica el hash de la contraseña y emite un token opaco.</li>
+<li>El cliente usa ese token como <code>Authorization: Bearer &lt;token&gt;</code>.</li>
+<li>El task-service no puede validarlo (no tiene la tabla), así que se lo reenvía al user-service.</li>
+<li>El user-service responde quién es. Si el token no existe o expiró, responde 401.</li>
+<li>El task-service recibe esa identidad como dict y sigue.</li>
+<li>El <code>user_id</code> sale de ahí. Nunca del cuerpo del request.</li>
+</ol>
+
+
+<h2 id="tabla-tokens">4. La tabla api_tokens (solo hashes)</h2>
+
+<pre><code>class ApiToken(Base):
+    __tablename__ = "api_tokens"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+
+    # Token opaco: se guarda solo el hash, el crudo sale una vez del login.
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(100), default="api-token")
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    user: Mapped[User] = relationship(User)</code></pre>
+
+<p>Aquí hay una FK, y está bien: es una integridad <em>interna</em> del user-service con su propia tabla. Lo que no existe son FKs cruzadas hacia tareas.</p>
+
+<p>Hay una diferencia deliberada con la versión Laravel de esta misma serie: aquí <code>expires_at</code> es <strong>NOT NULL</strong>. Un token sin caducidad sirve para siempre, y eso se hace imposible por esquema, no por convención. El TTL vive en la configuración (60 minutos) y la emisión lo estampa en cada fila.</p>
+
+<h3>Emitir el token</h3>
+
+<pre><code>def issue_token() -&gt; tuple[str, str]:
+    """Devuelve (token crudo, hash para guardar). El crudo viaja una sola vez."""
+    token = secrets.token_hex(32)
+    return token, hashlib.sha256(token.encode()).hexdigest()</code></pre>
+
+<h3>Buscar un token</h3>
+
+<pre><code>def authenticate(db: Session, authorization: str | None) -&gt; tuple[User, ApiToken]:
+    """¿Quién es este token? La respuesta es 401 ante token inválido o expirado."""
+    token = _bearer_token(authorization)
+    if token is None:
+        raise HTTPException(status_code=401, detail="Token no presentado o malformado")
+
+    row = db.query(ApiToken).filter(ApiToken.token_hash == security.hash_token(token)).first()
+    if row is None:
+        raise HTTPException(status_code=401, detail="Token inválido o expirado")
+
+    # Token caducado: para el cliente es idéntico a uno inexistente.
+    if row.expires_at &lt;= utcnow():
+        raise HTTPException(status_code=401, detail="Token inválido o expirado")
+
+    return row.user, row</code></pre>
+
+<p>La consulta es un índice único sobre un hash de 64 caracteres. O sea, O(1) y sin posibilidad práctica de colisión.</p>
+
+<div>
+<p><strong>Por qué SHA-256 y no bcrypt/Argon2:</strong> porque el token no es una contraseña que alguien pueda escoger. Son 32 bytes de <code>secrets.token_hex</code>, sin espacio de búsqueda que recorrer. El atacante tendría que adivinar el token entero; hashear es solo para que una fuga de la base de datos no sirva. Con la contraseña elegida por el usuario, el ataque de fuerza bruta sí es realista y ahí sí toca un hash lento: esta versión usa <strong>PBKDF2 de la biblioteca estándar</strong> (100 000 iteraciones, con <code>hmac.compare_digest</code>), cero dependencias.</p>
+</div>
+
+
+<h2 id="middleware">5. La dependencia del task-service</h2>
+
+<p>Este es el corazón del asunto. El task-service recibe un token que no puede validar, así que lo reenvía. En FastAPI el "middleware" de Laravel es una <strong>dependencia</strong>: FastAPI la resuelve antes de entrar al handler, en cada endpoint que la declare.</p>
+
+<pre><code>def get_current_user(
+    authorization: str | None = Header(default=None),
+) -&gt; dict[str, Any]:
+    parts = authorization.split(" ", 1) if authorization else []
+    if len(parts) != 2 or parts[0] != "Bearer" or not parts[1].strip():
+        # Header ausente o malformado: problema del cliente, se rechaza aquí
+        # sin llamar a la red.
+        raise HTTPException(status_code=401, detail="Token no presentado o malformado")
+    return verify_token(parts[1].strip())</code></pre>
+
+<p>Y todo lo que sabe que existe la red vive en un solo archivo:</p>
+
+<pre><code># app/user_service_client.py
+def _http_get(url: str, headers: dict[str, str]) -&gt; httpx2.Response:
+    with httpx2.Client(timeout=config.HTTP_TIMEOUT_SECONDS) as http:
+        return http.get(url, headers=headers)
+
+
+def verify_token(token: str) -&gt; dict[str, Any]:
+    """¿Quién es este token? Toda la frontera de red vive en este archivo:
+    los demás módulos reciben el dict del usuario como si fuera local."""
+    try:
+        resp = _http_get(
+            f"{config.USER_SERVICE_URL}/api/user",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    except (httpx2.ConnectError, httpx2.ConnectTimeout):
+        # Es un fallo de infraestructura, no de identidad: el cliente merece
+        # saber qué servicio falta y cómo levantarlo.
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "user-service no está en pie (se esperaba "
+                f"{config.USER_SERVICE_URL}); levántalo con "
+                "`uv run uvicorn app.main:app --port 8000` en user-service/"
+            ),
+        )
+
+    if resp.status_code == 200:
+        user = resp.json()
+        # El cliente del IdP devuelve {id, name, email}; nada más entra aquí.
+        return {"id": int(user["id"]), "name": str(user["name"]), "email": str(user["email"])}
+
+    if resp.status_code == 401:
+        # La distinción que importa: 401 NO es un fallo del servicio, es
+        # identidad inválida del token presentado.
+        raise HTTPException(status_code=401, detail="Token inválido o expirado")
+
+    raise HTTPException(
+        status_code=502,
+        detail=f"Respuesta inesperada del user-service (HTTP {resp.status_code})",
+    )</code></pre>
+
+<p>Fíjate en la distinción: <code>401</code> significa "identidad inválida" y baja como 401 propio. Una caída de conexión es <code>503</code>, con el comando exacto para levantar lo que falta. Cualquier otro status es un problema del peer y se traduce a <code>502</code>. Confundir esos casos es un bug clásico: termina tratando "tu token venció" como "el servidor se cayó".</p>
+
+<div>
+<p><strong>Una decisión con nombre:</strong> la función <code>_http_get</code> existe para que los tests la sustituyan. Ningún test de este proyecto toca la red: el IdP se stubbea cambiando esa función por otra que responde el status que toca. Es el equivalente exacto de <code>Http::fake()</code> en Laravel.</p>
+</div>
+
+<h3>El login, para completar el cuadro</h3>
+
+<pre><code>@router.post("/tokens", response_model=TokenIssued, status_code=201)
+def issue_token(payload: TokenRequest, db: Session = Depends(get_db)) -&gt; TokenIssued:
+    user = db.query(User).filter(User.email == payload.email).first()
+
+    # Mismo mensaje y mismo status para "no existe" y "contraseña mala": si no,
+    # esta respuesta sirve para enumerar qué emails están dados de alta.
+    if user is None or not security.verify_password(payload.password, user.password):
+        raise HTTPException(status_code=401, detail="Credenciales inválidas")
+
+    token, token_hash = security.issue_token()
+    expires_at = security.expiry()
+    row = ApiToken(
+        user_id=user.id,
+        token_hash=token_hash,
+        name=payload.device_name or "api-token",
+        expires_at=expires_at,
+    )
+    db.add(row)
+    db.commit()
+
+    return TokenIssued(
+        token=token,
+        token_type="Bearer",
+        expires_at=expires_at.replace(tzinfo=UTC),
+        user=UserInfo.model_validate(user),
+    )</code></pre>
+
+<h3>Y el logout que revoca de verdad</h3>
+
+<pre><code>@router.delete("/tokens", status_code=204)
+def revoke(
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+) -&gt; None:
+    user, row = authenticate(db, authorization)
+    db.query(ApiToken).filter(ApiToken.id == row.id).delete()
+    db.commit()</code></pre>
+
+<p>Muchas implementaciones olvidan este paso y el "cerrar sesión" solo borra una cookie del lado cliente: el token sigue sirviendo hasta que expira. Borrar la fila es una revocación real e inmediata, y es el trade-off que compra el token opaco. Verificado en el E2E: el <code>DELETE</code> responde 204 y el mismo token, usado un segundo después a través del task-service, recibe 401.</p>
+
+
+<h2 id="propiedad">6. De dónde sale el user_id, y por qué ya no se valida</h2>
+
+<p>Aquí está el cambio de fondo, y conviene mirarlo de cerca porque es la lección del ejercicio.</p>
+
+<pre><code>@router.post("/tasks", response_model=TaskOut, status_code=201)
+def create_task(
+    payload: TaskCreate,
+    current_user: dict[str, Any] = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -&gt; Task:
+    task = Task(
+        title=payload.title,
+        status=normalize_status(payload.status, STATUS_PENDING),
+        # El dueño lo pone el sistema: el cliente no manda user_id.
+        user_id=current_user["id"],
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    return task</code></pre>
+
+<p>Una versión sin auth llamaría al user-service por HTTP para comprobar que el <code>user_id</code> del payload fuera válido. <strong>Esa llamada no existe, y no es un descuido: es que sería redundante.</strong></p>
+
+<p>La dependencia acaba de confirmar por HTTP que ese mismo usuario existe. Preguntarlo otra vez sería pagar la latencia otra vez para obtener la misma respuesta. La validación y la autenticación hacen el mismo trabajo; con autenticación, la validación quedó absorbida.</p>
+
+<p>Y el <code>user_id</code> ni siquiera existe en el schema de entrada: <code>TaskCreate</code> valida <code>title</code> y <code>status</code>. Si un cliente manda <code>user_id</code> a propósito, pydantic lo descarta en silencio.</p>
+
+<pre><code>$ curl -X POST .../api/tasks -d '{"title":"Zapatos de boda","user_id":99}'
+{"title":"Zapatos de boda","user_id":1, ...}   [201]   # el 99 se ignoró</code></pre>
+
+<h3>Y las tareas de otros</h3>
+
+<pre><code>def find_owned(task_id: int, current_user: dict[str, Any], db: Session) -&gt; Task:
+    task = db.get(Task, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Tarea no encontrada")
+    if task.user_id != current_user["id"]:
+        raise HTTPException(status_code=403, detail="No es tu tarea")
+    return task</code></pre>
+
+<p>El <code>user_id</code> almacenado sí se sigue usando, pero para algo distinto: para comprobar propiedad, no para validar identidad. Esa distinción es el corazón del cambio.</p>
+
+<div>
+<p><strong>Un detalle que FastAPI regala gratis:</strong> las dependencias se resuelven <em>antes</em> que el handler, así que un anónimo que pida <code>/api/tasks/1</code> recibe 401 y nunca llega a tocar la base de datos. En la versión Laravel de esta serie, el <em>route model binding</em> corría antes del middleware de auth y filtraba qué ids existían (404 vs 403 para un dato que no debía conocer). Aquí el orden correcto viene de fábrica: primero identidad, después existencia.</p>
+</div>
+
+
+<h2 id="ui">7. ¿Y la sesión web?</h2>
+
+<p>La versión Laravel de este capítulo tenía una interfaz web con formulario de login que guardaba el token en la sesión del task-service. Esta versión no la tiene, y es una decisión de alcance, no un descuido: el capítulo 1 en FastAPI es API puro, y el cliente es siempre un programa (curl, test, SPA) que manda el header.</p>
+
+<p>Lo que sí conviene quedarse del diseño web es la regla que lo ordenaba: <strong>una sola fuente de identidad</strong>. Allí el middleware aceptaba el header o la sesión, y en ambos casos la validación ocurría siempre en el user-service. Aquí solo existe el header, así que la regla se cumple por defecto.</p>
+
+<p>Si algún día este proyecto crece una UI, el camino es el mismo que en Laravel: el task-service canjea credenciales por un token, lo guarda en su sesión y lo reenvía en cada request. El día que eso duela, es la señal de que toca la opción C de la sección 13 (login centralizado).</p>
+
+
+<h2 id="errores">8. Cuatro errores reales que aparecieron</h2>
+
+<p>Ninguno se detectó leyendo el código: los encontraron los tests y el curl del E2E.</p>
+
+<h3>8.1 Tres tests rojos por un reloj</h3>
+
+<p>La primera versión comparaba fechas <em>aware</em> contra fechas <em>naive</em>: la suite dio <code>3 failed, 4 passed</code>. La causa de fondo es sqlite, que no conserva el <code>tzinfo</code>: guardar datetimes aware en columnas y compararlos con <code>now()</code> aware es pedir comparaciones rotas.</p>
+
+<pre><code># la comparación de caducidad explotaba mezclando relojes
+row.expires_at &lt;= utcnow()   # naive vs aware -&gt; TypeError en algunos caminos</code></pre>
+
+<p><strong>La solución fue una regla, no un parche:</strong> en las columnas todo se guarda <strong>naive en UTC</strong> (el reloj del sistema convertido con <code>datetime.now(UTC).replace(tzinfo=None)</code>), y el <code>Z</code> de la respuesta ISO 8601 se añade al final, con <code>.replace(tzinfo=UTC)</code>, justo antes de serializar. El "aware" es un asunto de la respuesta al cliente, no del almacenamiento.</p>
+
+<h3>8.2 Un DELETE que respondía 401 siempre</h3>
+
+<p>Un parámetro <code>authorization: str = None</code> sin <code>Header()</code> — FastAPI lo leyó como <strong>query param</strong>. El header nunca llegaba a la función y el DELETE respondía 401 siempre, con el endpoint funcionando "bien" para los caminos que pasaban el header por otros medios en los tests.</p>
+
+<p><strong>La lección de FastAPI:</strong> nada es implícito. Un query param y un header se declaran igual de explícito, y la diferencia es una sola palabra (<code>Header()</code>) que decide de dónde viene el dato. La prueba que lo encontró pedía exactamente el mensaje del 401 propio.</p>
+
+<h3>8.3 El test que expiró otra fila</h3>
+
+<p>Un test de caducidad hacía <code>db.query(ApiToken).first()</code> y le restaba un minuto al <code>expires_at</code>. Con la base de datos compartida entre tests, <code>first()</code> traía el token de <strong>otro test anterior</strong>: el test expiraba una fila cualquiera y el aserto pasaba o fallaba por casualidad.</p>
+
+<p><strong>La solución:</strong> el test busca la fila por el hash del token que realmente usa — <code>hashlib.sha256(token.encode()).hexdigest()</code> — y expira esa. Y de regalo, una fixture autouse que borra los overrides de identidad al empezar cada test, para que nadie arrastre la identidad del anterior.</p>
+
+<h3>8.4 El esquema prefabricado que se comía el contrato</h3>
+
+<pre><code>security = HTTPBearer()   # detalle "oficial" de FastAPI
+
+def get_current_user(credentials = Depends(security)) -&gt; dict:
+    token = credentials.credentials
+    ...</code></pre>
+
+<p>La versión con <code>HTTPBearer</code> ahorra tres líneas y pierde el contrato: ante un header ausente o malformado responde <code>401 "Not authenticated"</code>, su mensaje genérico, no el nuestro. Además no puede rechazar el malformado sin red: no sabe que la frontera existe. El test que verifica "401 con nuestro mensaje y cero llamadas de red" lo detectó de inmediato.</p>
+
+<p><strong>La solución:</strong> la dependencia propia de la sección 5, que son unas diez líneas. En un capítulo sobre fronteras, el detalle donde se gobierna la frontera no se delega en un prefabricado que no sabe nada de ella.</p>
+
+
+<h2 id="matriz">9. Matriz de respuestas</h2>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Situación</th><th>user-service</th><th>task-service</th></tr>
+<tr><td>Sin header o malformado</td><td>—</td><td><strong>401</strong> "Token no presentado o malformado" (sin tocar la red)</td></tr>
+<tr><td>Token inválido o revocado</td><td>401</td><td><strong>401</strong> "Token inválido o expirado"</td></tr>
+<tr><td>Token caducado</td><td>401</td><td><strong>401</strong> "Token inválido o expirado"</td></tr>
+<tr><td>user-service apagado</td><td>—</td><td><strong>503</strong> + el comando para levantarlo</td></tr>
+<tr><td>user-service responde 500</td><td>500</td><td><strong>502</strong> "Respuesta inesperada del user-service (HTTP 500)"</td></tr>
+<tr><td>Tarea de otro usuario</td><td>—</td><td><strong>403</strong> "No es tu tarea"</td></tr>
+<tr><td>Tarea inexistente</td><td>—</td><td><strong>404</strong></td></tr>
+<tr><td>status fuera de pending|completed</td><td>—</td><td><strong>422</strong></td></tr>
+<tr><td>Token válido y tarea propia</td><td>200</td><td><strong>200 / 201</strong></td></tr>
+</table>
+
+<p>La distinción importante es la fila 2 contra la 4: <strong>"no sé quién eres" y "no puedo preguntarte quién eres"</strong> son dos problemas distintos y merecen respuestas distintas. Confundirlos convierte un simple "vuelve a loguearte" en un "el sistema está roto".</p>
+
+<p>Y hay una regla de cortesía que no es decoración: el 503 dice <em>qué servicio falta</em> y <em>el comando exacto para levantarlo</em>. Sin eso, el desarrollador que recibe el 503 ve "el sistema está caído" y tiene que adivinar cuál de las dos piezas.</p>
+
+
+<h2 id="verificar">10. Verificarlo con cURL</h2>
+
+<pre><code># 1. Login contra el user-service
+TOKEN=$(curl -s -X POST http://127.0.0.1:8000/api/tokens \
+  -H "Content-Type: application/json" \
+  -d '{"email":"ana.torres@example.com","password":"password"}' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+
+# 2. Sin header -&gt; 401
+curl -s http://127.0.0.1:8001/api/tasks
+# {"detail":"Token no presentado o malformado"}
+
+# 3. Con token -&gt; 200
+curl -s http://127.0.0.1:8001/api/tasks -H "Authorization: Bearer $TOKEN"
+
+# 4. Intentar inyectar un user_id -&gt; se ignora
+curl -s -X POST http://127.0.0.1:8001/api/tasks \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"title":"Zapatos de boda","user_id":99}'
+# -&gt; {"title":"Zapatos de boda","user_id":1}  201
+
+# 5. Con el token de Luis, la tarea de Ana -&gt; 403
+curl -s -o /dev/null -w "%{http_code}\n" \
+  http://127.0.0.1:8001/api/tasks/1 -H "Authorization: Bearer $TOKEN_DE_LUIS"
+# 403
+
+# 6. Revocar y reutilizar -&gt; 401
+curl -s -o /dev/null -X DELETE http://127.0.0.1:8000/api/tokens \
+  -H "Authorization: Bearer $TOKEN"
+curl -s http://127.0.0.1:8001/api/tasks -H "Authorization: Bearer $TOKEN"
+# {"detail":"Token inválido o expirado"}
+
+# 7. Apagar el user-service -&gt; 503 en TODO, en 4 ms
+curl -s http://127.0.0.1:8001/api/tasks -H "Authorization: Bearer $TOKEN"
+# {"detail":"user-service no está en pie (se esperaba http://127.0.0.1:8000);
+#  levántalo con `uv run uvicorn app.main:app --port 8000` en user-service/"}</code></pre>
+
+<p>Todos los pasos de esta lista son los del E2E real de este proyecto, corridos con los dos servidores en pie y medidos con <code>curl -w "%{time_total}"</code>.</p>
+
+
+<h2 id="precio">11. El precio: latencia y disponibilidad</h2>
+
+<p>Esta es la parte que conviene medir, no suponer. Números reales de este proyecto, con los dos servicios en pie en localhost (mediana de tres corridas):</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Petición</th><th>Latencia</th><th>Qué incluye</th></tr>
+<tr><td><code>POST /api/tokens</code> (login)</td><td>~10 ms</td><td>verificación PBKDF2 (100 000 iteraciones) + INSERT</td></tr>
+<tr><td><code>GET /api/user</code> (introspección directa)</td><td>~2 ms</td><td>SELECT por hash en el IdP</td></tr>
+<tr><td><code>GET /api/tasks</code> (vía frontera)</td><td>~3-6 ms</td><td>la introspección de arriba, más la consulta propia del task-service</td></tr>
+</table>
+
+<pre>
+SIN autenticación (antes)          CON autenticación por HTTP (ahora)
+
+Cliente ──── ~3ms ──▶ task-svc     Cliente ─── ~4ms ───▶ task-svc
+                                    ─── ~2ms ───▶ user-svc
+Total ≈ 3 ms                        Total ≈ 4-6 ms (introspección incluida)
+</pre>
+
+<p>El salto de red cuesta aquí unos 2 ms: es visible, y es justo lo que un JWT eliminaría. La honestidad del diseño consiste en mostrar ese número en la tabla en lugar de teorizarlo.</p>
+
+<h3>La cascada de disponibilidad</h3>
+
+<p>La disponibilidad del task-service pasa a depender de la del user-service de forma directa. Si el user-service está caído:</p>
+
+<ul>
+<li>El login falla (503).</li>
+<li>La API devuelve 503 en todo, incluso para lecturas.</li>
+<li>Cada respuesta 503 dice qué servicio falta y el comando para levantarlo.</li>
+</ul>
+
+<p>Con la conexión rechazada el 503 llega en ~4 ms (el SO dice "nadie escucha en ese puerto" al instante). El escenario caro es otro: el user-service <em>colgado</em> (acepta conexiones y no responde) haría esperar el timeout completo, que aquí es de 2 segundos por request. Un circuit breaker lo convertiría en un fallo inmediato; está en el roadmap, no en este capítulo.</p>
+
+<h3>Y lo que se ganó a cambio</h3>
+
+<ul>
+<li>El estado de identidad tiene <strong>un solo dueño</strong>. Nadie lo replica ni lo cachea.</li>
+<li>Revocar es borrar una fila. Inmediato, sin esperar expiraciones — probado en el paso 6 del E2E.</li>
+<li>El user-service puede aplicar sus propias reglas (TTL, anti-enumeración, rate limiting futuro) sin avisar a nadie.</li>
+</ul>
+
+
+<h2 id="alternativas">12. Las alternativas y cuándo tienen sentido</h2>
+
+<h3>Token stateless (JWT)</h3>
+
+<p>El user-service firma un JWT y el task-service verifica la firma en local, sin llamada de red. Resuelve exactamente el problema del apartado anterior.</p>
+
+<p><strong>A cambio:</strong></p>
+<ul>
+<li>Revocar se vuelve difícil. Hasta que expira, el token vale, lo borres o no.</li>
+<li>El payload no es secreto: es base64, no cifrado.</li>
+<li>El reloj de los servicios puede desincronizarse y romper <code>nbf</code> / <code>exp</code>.</li>
+<li>Si ya tienes base de datos, la tabla de revocación es una fila más.</li>
+</ul>
+
+<p><strong>Cuándo tiene sentido:</strong> cuando hay terceros que deben validar el token sin poder consultar tu base de datos. O cuando el user-service es el cuello de botella real.</p>
+
+<h3>mTLS o API Gateway</h3>
+
+<p>La respuesta de producción para tráfico interno. El servicio se identifica con un certificado (mTLS) o con un token de servicio emitido por un gateway con <code>client_credentials</code> de OAuth2: vida corta, audiencia específica, revocable.</p>
+
+<p>Ventaja sobre todo lo anterior: separa la identidad del <em>servicio</em> de la identidad del <em>usuario</em>. En el diseño de este artículo, el task-service reenvía el token de una persona en cada request; con mTLS, lo identifica el certificado del servidor y el token del usuario viaja dentro.</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Enfoque</th><th>Latencia</th><th>Revocación</th><th>Complejidad</th><th>Cuándo</th></tr>
+<tr><td>Validar por HTTP</td><td>1 salto</td><td>Inmediata</td><td>Baja</td><td>Aprendiendo, 2-3 servicios, monolito modular</td></tr>
+<tr><td>JWT</td><td>0 saltos</td><td>Compleja</td><td>Media</td><td>Muchos servicios, terceros validando</td></tr>
+<tr><td>mTLS / Gateway</td><td>0 saltos extra*</td><td>Por rotación</td><td>Alta</td><td>Producción seria, Kubernetes</td></tr>
+</table>
+
+<p><small>* mTLS no añade saltos de red, pero sí handshake TLS y gestión de certificados, que es donde está su coste real.</small></p>
+
+<p>El orden sensato es empezar por validar por HTTP porque es la opción que te deja <em>ver</em> el problema, y saltar a la siguiente cuando ese problema te esté doliendo. Montar mTLS antes de tener dos servicios es pagar una factura que todavía no te llegó.</p>
+
+
+<h2 id="tercer-servicio">13. ¿Y si hay un tercer microservicio?</h2>
+
+<p>Metamos un <strong>tags-service</strong>: mismo patrón que tasks, su propia base de datos, hablando con el user-service. La pregunta es si hay que volver a escribir el cliente y la dependencia de tasks, y qué alternativas existen.</p>
+
+<p>Antes de listar opciones conviene mirar qué es realmente lo que se duplicaría, porque no es lo que parece. En el task-service hay dos piezas:</p>
+
+<pre><code># task-service
+deps.py                   -&gt; lee el header, rechaza el malformado, llama a la frontera
+user_service_client.py    -&gt; verify_token(): la frontera de red (401 / 503 / 502)</code></pre>
+
+<p>Ninguna de las dos tiene nada de dominio de tareas. Su trabajo es: <strong>"soy un cliente del proveedor de identidad, dime quién es este token"</strong>. Eso es un rol de OAuth client, no de servicio de tareas.</p>
+
+<div>
+<p><strong>La observación que ordena el debate:</strong> hay dos piezas de naturaleza muy distinta.</p>
+<ul>
+<li>La <strong>dependencia</strong> (~10 líneas) es la frontera de seguridad. Es pequeña, casi no cambia, y su código es el mismo en cualquier servicio.</li>
+<li>El <strong>cliente del IdP</strong> (~50 líneas) lleva URL, timeout y la clasificación de errores. Es el que se va a duplicar.</li>
+</ul>
+<p>La pregunta "¿duplico el cliente?" en realidad es "¿cuántos sitios dejamos que implementen el baile de OAuth client?"</p>
+</div>
+
+<h3>Opción A — Duplicar en cada servicio</h3>
+
+<p>Copiar los dos módulos a tags-service tal cual. Es lo que haría cualquiera por defecto, y no es una mala decisión.</p>
+
+<p><strong>A favor:</strong> cada servicio se despliega y se rompe de forma independiente. Ningún servicio depende del release de otro.</p>
+
+<p><strong>En contra:</strong> N copias. Si mañana añades un circuit breaker al cliente, o cambias el mensaje del 503, tienes que acordarte de los N. El coste no es el tamaño del archivo: es el número de sitios donde puede olvidarse alguien de arreglar un fallo de seguridad.</p>
+
+<p><strong>Cuándo:</strong> con dos o tres servicios. Este proyecto tiene dos, y por eso la opción A es razonable hoy.</p>
+
+<h3>Opción B — Extraer a un paquete local compartido</h3>
+
+<p>Un paquete local, referenciado como <em>path dependency</em> de <code>uv</code> en el <code>pyproject.toml</code> de cada servicio, que exporta la dependencia, el cliente y los tipos.</p>
+
+<pre><code># pyproject.toml de cada servicio
+[tool.uv.sources]
+microservice-kit = { path = "../packages/microservice-kit" }
+
+dependencies = [
+    "fastapi&gt;=0.162",
+    "microservice-kit",
+]</code></pre>
+
+<p>Cada servicio recibe el código y puede extenderlo si necesita. Una sola fuente de verdad, y el bug de seguridad se arregla una vez.</p>
+
+<p><strong>A favor:</strong> una copia, versionable, y cada servicio puede ajustar lo suyo sin romper a los demás.</p>
+
+<p><strong>En contra, y es importante:</strong> <strong>acopla los ciclos de release</strong>. Un error en el paquete rompe los tres servicios a la vez, y cada servicio queda clavado en la versión que le funciona. Además aparece el problema clásico de "este servicio necesita un parche del paquete, y ya hay tres en producción". Es un coste que no se ve hasta el cuarto servicio.</p>
+
+<p><strong>Cuándo:</strong> cuando ya tienes más de tres o cuatro servicios <em>del mismo equipo</em> y despliegan juntos. Antes de eso es infraestructura por adelantado.</p>
+
+<h3>Opción C — Login centralizado en el user-service</h3>
+
+<p>El user-service aloja el formulario, recibe la contraseña, emite el token y devuelve al cliente a la app que lo pidió. El task-service y el tags-service <strong>no tienen ningún código de login</strong>: solo la dependencia.</p>
+
+<pre><code>Cliente ──▶ /login (en user-service)
+              │
+              ├─ POST /api/tokens  (allí mismo, sin salir del servicio)
+              │
+              └─▶ redirige a http://tasks.app.local/tasks  + el token</code></pre>
+
+<p><strong>El argumento fuerte, y es contraintuitivo:</strong> esto <strong>no añade acoplamiento nuevo</strong>. Todos los servicios ya dependen del user-service para validar cualquier request, así que mover el login allí no crea ninguna dependencia que antes no existiera. Lo que hace es <strong>eliminar código duplicado</strong>.</p>
+
+<p><strong>A favor:</strong> una sola UX de login en toda la organización. Y cuando llegue MFA, passkeys o "login con Google", se implementa <strong>una vez</strong> y todos los servicios lo heredan sin tocar una línea.</p>
+
+<p><strong>En contra:</strong> el user-service deja de ser solo un servicio de datos y se convierte en algo con cara de aplicación. Y aparece un problema serio de transporte, que es el siguiente punto.</p>
+
+<h3>El detalle que se cuela aquí: cómo cruza el token</h3>
+
+<p>El token tiene que volver del user-service al task-service de alguna manera, y cada opción tiene un problema distinto:</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Método</th><th>Cómo funciona</th><th>Riesgo</th></tr>
+<tr>
+<td><strong>Query string</strong><br><code>?token=...</code></td>
+<td>El redirect más simple</td>
+<td>El token queda en los logs del servidor, en el historial del navegador y en la cabecera <code>Referer</code> de la siguiente página. <strong>No usarlo.</strong></td>
+</tr>
+<tr>
+<td><strong>Fragment</strong><br><code>#token=...</code></td>
+<td>La parte tras el # nunca viaja al servidor</td>
+<td>Requiere JavaScript para leerlo y guardarlo. Funciona, pero mete JS en el camino crítico del login.</td>
+</tr>
+<tr>
+<td><strong>Cookie de dominio padre</strong><br><code>.app.local</code></td>
+<td>El user-service deja la cookie y <strong>todos</strong> los servicios la leen</td>
+<td>Exige que las apps compartan dominio padre. Y en realidad, ¿para qué volver al login si la cookie ya autentica a todas?</td>
+</tr>
+<tr>
+<td><strong>form_post</strong><br>(estándar OIDC)</td>
+<td>El user-service devuelve un formulario auto-enviado por POST</td>
+<td>Es el más correcto para el flujo servidor-a-servidor, y el más inusual de montar.</td>
+</tr>
+</table>
+
+<div>
+<p><strong>La observación:</strong> en cuanto piensas en cómo transportar el token entre servicios, descubres que la opción C empuja el problema hacia una respuesta más interesante, y por eso termina siendo la <strong>opción D</strong>.</p>
+</div>
+
+<h3>Opción D — API Gateway / BFF en el borde</h3>
+
+<p>Un componente delante de todos los servicios hace el login <em>una vez</em> y entrega a cada servicio una identidad ya resuelta en una cabecera. Los servicios dejan de hablar de autenticación por completo.</p>
+
+<pre><code>Cliente ──▶ Gateway ──X-Authenticated-User: {"id":1,...}──▶ task-service
+                │
+                ├─▶ tags-service
+                └─▶ user-service
+
+Los servicios ya NO llaman al user-service en cada request.</code></pre>
+
+<p><strong>A favor:</strong> elimina el salto de red por request (el problema de la sección 11, resuelto de raíz), la política queda en un solo sitio, y añadir un servicio nuevo no requiere tocar auth en absoluto.</p>
+
+<p><strong>En contra, y son graves:</strong></p>
+
+<ul>
+<li><strong>La cabecera se puede falsificar.</strong> Si alguien alcanza task-service saltándose el gateway, puede mandar <code>X-Authenticated-User</code> a mano y ser Ana. La red interna tiene que estar cerrada y verificada, o la cabecera tiene que ir firmada.</li>
+<li>El gateway pasa a ser <strong>infraestructura crítica</strong>: si se cae, no entra nadie.</li>
+<li>Introduce un componente más que operar, con su propio despliegue, sus logs y sus versiones.</li>
+</ul>
+
+<p><strong>Cuándo:</strong> en producción con Kubernetes, cuando el número de servicios hace que la latencia por request importe de verdad. No antes.</p>
+
+<h3>Opción E — Que el cliente haga el login</h3>
+
+<p>Una SPA o app móvil habla solo con el user-service (o el gateway) para autenticarse, guarda el token en su propio almacenamiento, y lo envía en cada request. Ningún servicio tiene formulario de login.</p>
+
+<p><strong>A favor:</strong> los servicios quedan sin una línea de código de UI de autenticación. Es el patrón normal en mobile, y de hecho es lo que este proyecto ya es: el "cliente" de la sección 10 es exactamente eso.</p>
+
+<p><strong>En contra:</strong> necesitas ese cliente. Y el token vive en el navegador, lo que reabre la discusión entera de XSS vs httpOnly cookie.</p>
+
+<h3>Comparación</h3>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr>
+<th>Opción</th>
+<th>Código de login por servicio</th>
+<th>Saltos de red por request</th>
+<th>Riesgo principal</th>
+<th>Cuándo</th>
+</tr>
+<tr>
+<td><strong>A. Duplicar</strong></td>
+<td>Sí, N copias</td>
+<td>1</td>
+<td>Olvidarse de arreglar un fallo en los N sitios</td>
+<td>2-3 servicios</td>
+</tr>
+<tr>
+<td><strong>B. Paquete</strong></td>
+<td>No, se hereda</td>
+<td>1</td>
+<td>Acoplar los ciclos de release</td>
+<td>4+ servicios del mismo equipo</td>
+</tr>
+<tr>
+<td><strong>C. Login central</strong></td>
+<td>No</td>
+<td>1</td>
+<td>El token viaja en la redirección</td>
+<td>Cuando el login repetido duela</td>
+</tr>
+<tr>
+<td><strong>D. Gateway</strong></td>
+<td>No, ni dependencia</td>
+<td>0</td>
+<td>Cabecera falsificable si la red no está cerrada</td>
+<td>Producción seria, muchos servicios</td>
+</tr>
+<tr>
+<td><strong>E. Cliente</strong></td>
+<td>No</td>
+<td>1</td>
+<td>El token en el navegador</td>
+<td>Si ya hay SPA o app móvil</td>
+</tr>
+</table>
+
+<h3>Qué haría yo aquí</h3>
+
+<p>Con task-service y tags-service, <strong>seguiría con la opción A</strong>, pero con una disciplina mínima que la hace tolerable:</p>
+
+<ol>
+<li>La <strong>dependencia</strong> se mantiene sin cambios: es la frontera de seguridad y debe ser idéntica en todas partes. Si algún día hay que cambiarla, se cambia en todos a la vez, y los tests de los tres servicios la cubren.</li>
+<li>El <strong>contrato de errores</strong> (401 / 503 / 502 con sus mensajes) también se mantiene idéntico, por el mismo motivo.</li>
+<li>El <strong>cliente del IdP</strong> es candidato natural a moverse al user-service (opción C) en cuanto exista una tercera aplicación. No antes: con dos, la duplicación es más barata que el acoplamiento.</li>
+</ol>
+
+<p>El <strong>momento exacto</strong> del cambio no lo marca el número de servicios, sino una pregunta concreta: <em>"¿cuántas veces al mes me va a doler corregir el login en todos lados a la vez?"</em> Si la respuesta es "una", quédate en A. Si es "varias", ve a C.</p>
+
+<h3>El anti-patrón a evitar</h3>
+
+<p>Existe una sexta opción que parece sensata y no lo es: <strong>convertir el user-service en el dueño de las sesiones de los demás servicios</strong>, de forma que task-service y tags-service consulten "quién es el usuario de esta sesión" directamente, sin tokens.</p>
+
+<p>Rota el aislamiento por dentro: el user-service acaba guardando estado de sesión de otras aplicaciones, y cualquier servicio que quiera saber quién es necesita hablar con él de todos modos. Se parece a la opción C pero pierde el control de la sesión, que es justo lo que hace útil al token.</p>
+
+
+<h2 id="libreria-compartida">14. Un paquete con código reutilizable</h2>
+
+<p>La intuición es correcta y es la respuesta que más se repite en equipos que llevan tiempo con microservicios. Pero conviene separar tres cosas que aquí van mezcladas: <em>qué conviene compartir</em>, <em>con qué mecanismo</em>, y <em>cuándo conviene hacerlo</em>.</p>
+
+<div>
+<p><strong>Esto ya está en el artículo:</strong> lo que se propone es la opción B de la sección 13, un paquete local de <code>uv</code>, con el riesgo de acoplar ciclos de release que allí se menciona. Lo que sigue es el detalle fino: qué se comparte, cómo se hereda y cuándo compensa.</p>
+</div>
+
+<h3>14.1 "Una carpeta" tiene tres problemas que no son de estilo</h3>
+
+<p>Antes de elegir la herramienta, hay que ver por qué el naive no funciona. Una carpeta compartida entre servicios parece inocente, pero:</p>
+
+<ul>
+<li><strong>Git no comparte historia.</strong> Si <code>shared/get_current_user.py</code> vive en el repo de task-service y tags-service la importa, Git no sabe que son el mismo archivo. Un <code>git blame</code> no lleva de un servicio al otro, y el historial de un cambio de seguridad no aparece en ninguno de los dos.</li>
+<li><strong>Un cambio obliga a mover todos.</strong> Si es código compartido, entonces está acoplado: tocarlo significa que todos los servicios consumidores cambian de comportamiento en el mismo momento. Eso no es una carpeta, es un despliegue coordinado disfrazado.</li>
+<li><strong>Nadie sabe qué es "compartido".</strong> En la práctica la carpeta crece hasta que contiene la mitad de la aplicación y nadie sabe qué es API pública y qué es interno de un servicio.</li>
+</ul>
+
+<p>Ese último punto es el que mata las carpetas compartidas en la práctica. La frontera se diluye sola.</p>
+
+<h3>14.2 "Heredar" es el mecanismo equivocado</h3>
+
+<p>La pregunta sería si los servicios futuros podrían <em>heredar</em> de los módulos del task-service. Conviene separar dos cosas:</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th></th><th>Herencia</th><th>Composición</th></tr>
+<tr>
+<td>tags-service <em>hereda</em> de la dependencia de tasks</td>
+<td>Cambias la frontera para los dos a la vez</td>
+<td>Nadie lo nota</td>
+</tr>
+<tr>
+<td>tags-service <em>usa</em> la dependencia de tasks</td>
+<td>Cambias solo un servicio, a propósito</td>
+<td>El diff lo muestra explícitamente</td>
+</tr>
+<tr>
+<td>Cambiar la autenticación a JWT en el futuro</td>
+<td>Imposible solo en uno</td>
+<td>Cambias uno, pruebas, decides</td>
+</tr>
+</table>
+
+<p><strong>El caso del JWT lo deja claro:</strong> la sección 12 de este artículo dice que el día que se pase a JWT habrá que cambiar la autenticación. Con herencia no se puede cambiar en un solo servicio sin arrastrar a todos. Con composición, se cambia en uno, se despliega, se mide, y solo después se extiende.</p>
+
+<p>La conclusión no es "nunca heredes", sino: <strong>hereda comportamiento, compone decisiones</strong>. Una clase base para "toda aplicación web con login" es razonable. Heredar de "la autenticación por HTTP contra el user-service" es casarse con una decisión que explícitamente se dejó abierta para poder cambiarla.</p>
+
+<h3>14.3 Lo que de verdad es reutilizable</h3>
+
+<p>La pregunta útil no es "¿comparto la dependencia?", sino "<strong>¿qué lleva dentro cada módulo: vocabulario o decisiones?</strong>"</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Candidato</th><th>¿Qué lleva dentro?</th><th>Riesgo de compartirlo</th><th>Veredicto</th></tr>
+<tr>
+<td>El dict <code>{id, name, email}</code></td>
+<td>Solo un contrato de datos</td>
+<td>Ninguno. Es vocabulario</td>
+<td><strong>Compartir ya</strong></td>
+</tr>
+<tr>
+<td>Chequeo de propiedad (<code>find_owned</code>)</td>
+<td>Un patrón de autorización por dueño</td>
+<td>Bajo. Casi todos los servicios lo querrán</td>
+<td><strong>Compartir ya</strong></td>
+</tr>
+<tr>
+<td>Contrato de errores (401 / 503 / 502)</td>
+<td>La política de cómo se traduce una caída de red</td>
+<td>Bajo, y evita respuestas inconsistentes</td>
+<td><strong>Compartir ya</strong></td>
+</tr>
+<tr>
+<td><code>user_service_client</code></td>
+<td>URL, timeout, clasificación de errores, <em>y la decisión de validar por HTTP</em></td>
+<td>Medio. Es justo lo que se va a cambiar si se pasa a JWT</td>
+<td><strong>Compartir la interfaz, no la implementación</strong></td>
+</tr>
+<tr>
+<td><code>get_current_user</code></td>
+<td>La frontera de seguridad, atada a un proveedor concreto</td>
+<td>Alto. Es la decisión central del diseño</td>
+<td><strong>No compartir todavía</strong></td>
+</tr>
+<tr>
+<td>Schemas de login (formularios, respuestas)</td>
+<td>UX: qué se pide y qué se devuelve</td>
+<td>Bajo técnicamente, alto en fricción de despliegue</td>
+<td><strong>No compartir</strong> (ver 14.2)</td>
+</tr>
+</table>
+
+<div>
+<p><strong>La regla que sale de esta tabla:</strong> comparte el vocabulario, no las decisiones. "Un usuario autenticado es un dict con id, name y email" es un concepto estable. "Para validar quién es, hay que llamar por HTTP al user-service" es una decisión de arquitectura, y las decisiones se cambian sustituyendo, no heredando.</p>
+</div>
+
+<h3>14.4 Las cinco formas de compartir de verdad</h3>
+
+<p>Una vez que se sabe qué se comparte, el mecanismo importa menos de lo que parece:</p>
+
+<h4>A. Carpeta copiada a mano</h4>
+<pre><code>cp ../task-service/app/user_service_client.py app/
+cp ../task-service/app/deps.py app/</code></pre>
+<p><strong>A favor:</strong> cero acoplamiento. Cada servicio se despliega y se rompe solo, y es trivial de entender.<br>
+<strong>En contra:</strong> divergencia silenciosa. Si arreglas un fallo de seguridad, los otros se quedan con la versión vieja, y no hay nada que te avise.</p>
+
+<h4>B. Paquete local con path dependency de uv</h4>
+<pre><code>uv add --path ../packages/microservice-kit</code></pre>
+<p><strong>A favor:</strong> una fuente de verdad real, y es la opción más simple de montar sin publicar nada.<br>
+<strong>En contra, y es lo que más muerde:</strong> sin versión fijada, un cambio en el paquete aparece en todos los servicios <strong>sin que nadie lo decida</strong>. Fijar la versión resuelve eso, y en cuanto la fijas estás haciendo releases: el acoplamiento vuelve por la puerta de atrás.</p>
+
+<h4>C. Git submodule</h4>
+<p><strong>A favor:</strong> un commit del submodule apunta a un punto exacto del repositorio compartido, así que la trazabilidad es perfecta.<br>
+<strong>En contra:</strong> la experiencia de desarrollo es mala. Todo el mundo odia trabajar con submodules. Clonar, actualizar, resolver conflictos, y un <code>git status</code> que no dice nada útil. Para código de aplicación es una mala señal.</p>
+
+<h4>D. Paquete en un registry privado</h4>
+<p><strong>A favor:</strong> la forma profesional. Versionado semántico real, cada servicio fija la versión que le funciona, y se actualiza cuando el equipo lo decide.<br>
+<strong>En contra:</strong> hay que publicar releases de verdad. Un paquete para tres consumidores, donde uno solo es el que produce el cambio, es mucha ceremonia para poca cobertura.</p>
+
+<h4>E. Generar en lugar de compartir</h4>
+<p>En lugar de una dependencia, una plantilla: un comando que al crear un servicio nuevo le estampa el patrón actual. A partir de ahí, cada servicio es <strong>libre</strong> y diverge sin culpa.</p>
+<pre><code>uv run python -m kit.new_service tags
+# -&gt; crea tags-service con:
+#    - user_service_client.py (copia, editable)
+#    - deps.py (copia, editable)
+#    - tests que ya pasan contra el user-service real</code></pre>
+<p><strong>A favor:</strong> combina lo mejor de las dos cosas. Los servicios nuevos nacen consistentes y sus tests ya funcionan, pero después no hay ninguna dependencia que los ate. Un cambio en tags-service no rompe a nadie, y el siguiente servicio lo vuelve a coger con la versión mejorada.<br>
+<strong>En contra:</strong> no resuelve el bug de seguridad en los servicios ya existentes. Para eso hace falta la opción B o D, pero solo para el contrato de datos y el contrato de errores, que es donde no hay decisiones.</p>
+
+<h3>14.5 La regla de tres</h3>
+
+<p>Existe una regla empírica antigua y sigue siendo la mejor guía: <strong>no extraigas hasta la tercera copia.</strong></p>
+
+<p>Con task-service y tags-service hay <em>dos</em>. Extraer con dos instancias es prematuro por dos razones: todavía no sabes qué parte es común y cuál es propia de cada servicio, y el coste del mecanismo no se ha justificado con nadie. Cuando llegue el tercero, ya tendrás la respuesta empírica de qué se parece en la realidad, no en tu imaginación.</p>
+
+<h3>14.6 El coste invisible: los tests</h3>
+
+<p>Hay un efecto secundario que solo se nota después, y merece su propio párrafo. El código compartido sin tests compartidos es <strong>peor que el código duplicado con sus tests</strong>:</p>
+
+<ul>
+<li>Con código duplicado, cada servicio tiene sus tests y su copia. Si rompes algo, lo detectas en ese servicio. El coste es mantener copias.</li>
+<li>Con código compartido, los tests viajan con el código, pero solo se ejecutan en el CI de quien tiene el paquete. Si un servicio se actualiza a una versión nueva y el otro se queda atrás, <strong>cada uno ejecuta tests distintos sobre el mismo código, y ninguno cubre la combinación</strong>.</li>
+</ul>
+
+<p>Por eso, si se comparte algo, lo que se comparte tiene que ser <em>el código junto con sus tests</em>, y el CI de cada servicio tiene que correr la suite de ambos. Si eso no es posible, es una señal de que compartir era la decisión equivocada.</p>
+
+<h3>14.7 Mi opinión</h3>
+
+<p>Con lo que hay hoy: <strong>genera, no compartas</strong>. Es decir, la opción E para lo que viene, y no extraer todavía nada.</p>
+
+<p>El orden que propongo, en el tiempo:</p>
+
+<ol>
+<li><strong>Ahora (2 servicios):</strong> nada. Duplica si hace falta. Que tags-service tenga su propia copia de la dependencia, y que se llame igual. Las dos van a estar bien durante meses.</li>
+<li><strong>Con el tercer servicio:</strong> aplica la regla de tres. Mira qué se parece en la realidad y qué no, y entonces decide.</li>
+<li><strong>Lo que sí puedes compartir desde ya</strong>, y que es gratis: el contrato del dict de identidad y el contrato de errores 401/503/502 (que además evita respuestas inconsistentes entre servicios). Eso entra en una path dependency sin ningún riesgo, porque no contiene ninguna decisión de arquitectura.</li>
+<li><strong>Lo que no debes compartir nunca:</strong> la decisión de validar por HTTP. Eso vive en cada servicio, y el día que se cambie a JWT o a gateway, se cambia en uno, se despliega, se mide, y solo después se extiende.</li>
+</ol>
+
+<p>Y la regla de oro que resume todo el capítulo: <strong>comparte el vocabulario, compone las decisiones</strong>.</p>
+
+<div>
+<p><strong>La trampa de fondo:</strong> la sensación de que "compartir código" es sin coste de verdad. Compartir es la manera barata de <em>no volver a escribir</em>, pero paga en <em>no poder cambiar</em>. En un sistema que todavía está cambiando de arquitectura —y este lo está, de HTTP a JWT a gateway— esa es justo la moneda que no quieres gastar.</p>
+</div>
+
+
+<h2 id="limitaciones">15. Limitaciones honestas</h2>
+
+<ul>
+<li><strong>Sin circuit breaker.</strong> Con el user-service colgado, cada request espera el timeout completo (2 s) antes de rendirse. Un circuit breaker lo convertiría en un fallo inmediato.</li>
+<li><strong>Un salto de red en cada request.</strong> Aquí son ~2 ms medidos; multiplicado por latencia alta y concurrencia, es el techo de escalado del diseño.</li>
+<li><strong>Introspección sin caché.</strong> Cada request autenticado toca la base de datos del user-service. No hay caché de identidad: con TTL de 60 minutos y revocación inmediata, cachear la identidad sería reabrir la ventana que el token opaco cerró.</li>
+<li><strong>Sin refresh tokens.</strong> El cliente tiene que pedir un token nuevo con la contraseña cuando caduca (60 minutos). Aceptable en local, incómodo en una app real.</li>
+<li><strong>Sin rate limiting en la emisión.</strong> <code>POST /api/tokens</code> es el endpoint que recibe contraseñas: el primero que debería estar limitado. La versión Laravel de esta serie lo añadió como capítulo aparte; aquí tocará lo mismo.</li>
+<li><strong>Una sola identidad.</strong> No hay roles ni permisos. Cualquier usuario autenticado puede tocar sus propias tareas, que es lo correcto, pero no hay un modelo de autorización más rico.</li>
+<li><strong>Sin interfaz web.</strong> El cliente es siempre un programa que manda el header. La sesión web con token guardado es el capítulo que esta versión del proyecto no tiene (ver sección 7).</li>
+</ul>
+
+
+<hr>
+
+<footer>
+<p><em>Nota:</em> la implementación usa tokens opacos generados con <code>secrets.token_hex</code> y almacenados como SHA-256, sin bibliotecas de auth añadidas: PBKDF2 viene de la biblioteca estándar. La validación se hace por HTTP contra el user-service en cada request, de forma deliberada, para poder observar el costo en lugar de teorizarlo.</p>
+</footer>
+
+</article>
+
+</body>
+</html>

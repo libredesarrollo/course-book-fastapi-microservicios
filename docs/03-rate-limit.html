@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>Rate limiting en el login: el antes y el después</title>
+
+<meta name="description" content="Qué cambió al proteger POST /api/tokens contra fuerza bruta en FastAPI: límites por cuenta e IP, ventana de 60 segundos, registro de intentos y el 429 con Retry-After.">
+<meta name="keywords" content="rate limiting FastAPI, throttle, protección fuerza bruta, login rate limit, seguridad microservicios, tokens opacos">
+<meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
+<meta name="theme-color" content="#0969da">
+
+<meta property="og:type" content="article">
+<meta property="og:locale" content="es_ES">
+<meta property="og:site_name" content="desarrollolibre.net">
+<meta property="og:title" content="Rate limiting en el login: el antes y el después">
+<meta property="og:description" content="Qué cambió al proteger POST /api/tokens contra fuerza bruta en FastAPI: límites por cuenta e IP, registro de intentos y el 429.">
+
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Rate limiting en el login: el antes y el después">
+<meta name="twitter:description" content="Límites por cuenta e IP, registro de intentos y el 429, con las mediciones reales.">
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "TechArticle",
+  "headline": "Rate limiting en el login: el antes y el después",
+  "description": "Qué cambió al proteger POST /api/tokens contra fuerza bruta en FastAPI: límites por cuenta e IP, registro de intentos y el 429, con las mediciones.",
+  "inLanguage": "es",
+  "datePublished": "2026-11-11",
+  "dateModified": "2026-11-11",
+  "proficiencyLevel": "Intermediate",
+  "articleSection": "FastAPI",
+  "keywords": "rate limiting, FastAPI, throttle, fuerza bruta, seguridad, tokens",
+  "isAccessibleForFree": true,
+  "publisher": { "@type": "Organization", "name": "desarrollolibre.net" }
+}
+</script>
+
+</head>
+<body>
+
+<article>
+
+<header>
+<h1>Rate limiting en el login: el antes y el después</h1>
+
+<p><strong>Resumen:</strong> el user-service exponía <code>POST /api/tokens</code> sin ninguna protección. Medido: ~3 700 intentos de contraseña por minuto, las 24 horas del día. Este capítulo recoge qué había antes, qué se añadió después, por qué son dos límites y no uno, y los tres errores que aparecieron al implementarlo.</p>
+
+<p>Contexto: es el endpoint que <strong>recibe contraseñas</strong>. No es un endpoint cualquiera — es la puerta de entrada al sistema de identidad, y por lo tanto el objetivo natural de cualquier intento de fuerza bruta.</p>
+</header>
+
+<nav>
+<h2>Contenido</h2>
+<ol>
+<li><a href="#antes">El estado anterior</a></li>
+<li><a href="#medicion">La medición que lo destapó</a></li>
+<li><a href="#despues">Qué se añadió</a></li>
+<li><a href="#config">La configuración</a></li>
+<li><a href="#dos-limites">Por qué dos límites y no uno</a></li>
+<li><a href="#rutas">Dónde se aplica</a></li>
+<li><a href="#ttl">Caducidad: por qué NOT NULL</a></li>
+<li><a href="#logs">Qué se registra y qué no</a></li>
+<li><a href="#verificacion">Verificación real</a></li>
+<li><a href="#errores">Tres errores al implementarlo</a></li>
+<li><a href="#proxies">La trampa de los proxies</a></li>
+<li><a href="#tests">Cobertura de tests</a></li>
+<li><a href="#pendiente">Lo que queda abierto</a></li>
+</ol>
+</nav>
+
+<hr>
+
+
+<h2 id="antes">1. El estado anterior</h2>
+
+<p>La ruta era exactamente esto:</p>
+
+<pre><code>@router.post("/tokens", response_model=TokenIssued, status_code=201)
+def issue_token(payload: TokenRequest, db: Session = Depends(get_db)) -&gt; TokenIssued:
+    user = db.query(User).filter(User.email == payload.email).first()
+
+    if user is None or not security.verify_password(payload.password, user.password):
+        raise HTTPException(status_code=401, detail="Credenciales inválidas")
+    ...</code></pre>
+
+<p>Sin dependencias de seguridad. El handler hacía su trabajo y ya. A favor de esta versión, una cosa sí la tenía bien desde el capítulo 1: el token se emitía <strong>con caducidad obligatoria</strong> (<code>expires_at</code> NOT NULL, TTL de 60 minutos). Lo que faltaba era el resto.</p>
+
+<h3>Las dos carencias</h3>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th></th><th>Estado anterior</th><th>Riesgo</th></tr>
+<tr>
+<td><strong>Sin rate limit</strong></td>
+<td>El endpoint aceptaba intentos ilimitados</td>
+<td>Fuerza bruta contra contraseñas. La más grave de las dos.</td>
+</tr>
+<tr>
+<td><strong>Sin registro</strong></td>
+<td>Un 401 no dejaba rastro</td>
+<td>Una fuerza bruta era completamente silenciosa. Nadie se enteraba hasta que un usuario perdía su cuenta.</td>
+</tr>
+</table>
+
+<div>
+<p><strong>El detalle que lo hace más grave:</strong> aquí no existe la excusa del "pero la
+web tenía su propio throttle", que fue lo que encontró la versión Laravel de esta misma serie
+(una UI con <code>throttle:6,1</code> junto a una API desnuda). En este proyecto el capítulo 1
+es API puro, así que no había ni la ilusión de protección: el endpoint abierto era el único
+camino.</p>
+</div>
+
+
+<h2 id="medicion">2. La medición que lo destapó</h2>
+
+<p>Cincuenta intentos con contraseña incorrecta, medidos contra el servidor de verdad:</p>
+
+<pre><code>$ for i in $(seq 1 50); do
+    curl -s -o /dev/null -X POST http://127.0.0.1:8000/api/tokens \
+      -H "Content-Type: application/json" \
+      -d '{"email":"ana.torres@example.com","password":"intento'$i'"}'
+  done
+
+  50 intentos en 0.81 s -&gt; ~3 700 req/min sin ninguna protección</code></pre>
+
+<p>Un atacante con una conexión decente multiplica esa cifra por cien sin esfuerzo. Y como la
+base de usuarios es SQLite con dos filas, el cuello de botella lo pone el proceso, no el
+almacenamiento: a escala real el número sería mayor. (La versión Laravel de este mismo
+experimento midió 8 439 req/min; el número no importa, la orden de magnitud sí.)</p>
+
+<div>
+<p><strong>La lección del método:</strong> no hubo que leer el código para saber que faltaba
+algo. Bastó con pedir lo que un atacante pediría y medirlo. Un rate limit que no has probado
+no existe.</p>
+</div>
+
+
+<h2 id="despues">3. Qué se añadió</h2>
+
+<pre><code>ANTES                                 DESPUÉS
+
+POST /api/tokens                      POST /api/tokens
+(sin dependencia de seguridad)        (rate_limit_login)
+                                      
+sin límite                            5/min por cuenta (clave email+IP)
+                                      20/min por IP
+                                      ventana de 60 segundos
+                                      
+intentos fallidos: nada               WARNING con email, IP
+                                      y si la cuenta existe
+                                      
+50 intentos: 50 x 401                 6to intento: 429 + Retry-After
+                                      (cuenta también los aciertos)</code></pre>
+
+
+<h2 id="config">4. La configuración</h2>
+
+<p>Todo sale de <code>app/config.py</code>:</p>
+
+<pre><code># Límites de intentos de login sobre POST /api/tokens (recibe contraseñas).
+# Dos contadores: por cuenta (martilleo) y por IP (barrido de emails).
+LOGIN_THROTTLE_PER_ACCOUNT = _int("LOGIN_THROTTLE_PER_ACCOUNT", 5)
+LOGIN_THROTTLE_PER_IP = _int("LOGIN_THROTTLE_PER_IP", 20)
+LOGIN_THROTTLE_DECAY_SECONDS = _int("LOGIN_THROTTLE_DECAY_SECONDS", 60)</code></pre>
+
+<p>Y en el entorno, si hace falta apretarlos o aflojarlos:</p>
+
+<pre><code>LOGIN_THROTTLE_PER_ACCOUNT=5
+LOGIN_THROTTLE_PER_IP=20
+LOGIN_THROTTLE_DECAY_SECONDS=60</code></pre>
+
+<div>
+<p><strong>Por qué variables de entorno y no constantes en el código:</strong> cambiar
+un límite de 5 a 20 no debería requerir un deploy. Es una decisión operativa, y las decisiones
+operativas viven en el entorno.</p>
+</div>
+
+
+<h2 id="dos-limites">5. Por qué dos límites y no uno</h2>
+
+<p>El limitador vive en <code>app/rate_limit.py</code> y es una función con dos contadores:</p>
+
+<pre><code>def check_login(request: Request, email: str) -&gt; None:
+    """Dos contadores porque son dos ataques distintos:
+    - por IP: un barrido de muchas cuentas desde un mismo origen;
+    - por cuenta (clave email+IP): una sola cuenta martilleada desde una IP.
+    Cuenta TODO intento, no solo los fallidos: un límite que solo frena los
+    errores es decorativo, basta acertar en el intento 21."""
+    now = time.monotonic()
+    ip = client_ip(request)
+    pairs = (
+        (f"ip:{ip}", config.LOGIN_THROTTLE_PER_IP),
+        (f"email:{_email_key(email)}|ip:{ip}", config.LOGIN_THROTTLE_PER_ACCOUNT),
+    )
+    with _lock:
+        for key, limit in pairs:
+            hits = _hits[key]
+            while hits and now - hits[0] &gt;= config.LOGIN_THROTTLE_DECAY_SECONDS:
+                hits.popleft()
+            if len(hits) &gt;= limit:
+                wait = int(config.LOGIN_THROTTLE_DECAY_SECONDS - (now - hits[0])) + 1
+                raise HTTPException(
+                    status_code=429,
+                    detail="Demasiados intentos de login; inténtalo más tarde",
+                    headers={"Retry-After": str(wait)},
+                )
+        for key, _limit in pairs:
+            _hits[key].append(now)</code></pre>
+
+<p>Son dos ataques distintos y cada uno necesita su contador:</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Ataque</th><th>¿Lo frenaría un solo límite de 20/min?</th><th>Qué lo detiene aquí</th></tr>
+<tr>
+<td><strong>Una cuenta, una IP</strong><br><span class="small">La forma más común</span></td>
+<td>Sí, pero tardaría 20 intentos</td>
+<td>El de cuenta corta en <strong>5</strong></td>
+</tr>
+<tr>
+<td><strong>Una cuenta, muchas IP</strong><br><span class="small">Botnet o proxys rotos</span></td>
+<td><strong>No.</strong> Cada IP tiene su presupuesto y ninguno se agota</td>
+<td>El de cuenta lleva la IP en la clave, así que cambia al cambiar la IP… pero combinado con el de IP, el atacante tampoco puede rotar libremente</td>
+</tr>
+<tr>
+<td><strong>Muchas cuentas, una IP</strong><br><span class="small">Barrido de emails</span></td>
+<td>Sí, a los 20 intentos</td>
+<td>El de IP corta en <strong>20</strong></td>
+</tr>
+</table>
+
+<div>
+<p><strong>Se aplica el más estricto de los dos.</strong> En cuanto uno se agota la respuesta
+es 429, y los intentos posteriores también cuentan como consumido, así que agotar uno agota
+ambos.</p>
+<p><strong>Detalle de la clave por cuenta:</strong> lleva la IP. Si no, el límite por cuenta se
+compartiría entre todas las IP, y el atacante solo tendría que rotar IP para no agotarlo nunca.</p>
+<p><strong>Y un detalle de implementación:</strong> la ventana es <em>deslizante</em> — cada
+intento vale 60 segundos desde que ocurrió. La contabilidad cabe en una cola por clave, y el
+<code>reset()</code> existe para que los tests no se hereden contadores entre sí.</p>
+</div>
+
+
+<h2 id="rutas">6. Dónde se aplica</h2>
+
+<pre><code>def rate_limit_login(request: Request, payload: TokenRequest) -&gt; None:
+    """Fuerza bruta contra el endpoint que recibe contraseñas: dos contadores
+    con los límites y la ventana de app/config.py."""
+    check_login(request, payload.email)
+
+
+@router.post(
+    "/tokens",
+    response_model=TokenIssued,
+    status_code=201,
+    dependencies=[Depends(rate_limit_login)],
+)</code></pre>
+
+<p>En FastAPI, una dependencia declarada en <code>dependencies=[...]</code> corre antes del
+handler y puede pedir el body (<code>TokenRequest</code>) — FastAPI lo parsea una sola vez y
+lo reutiliza, así que el email está disponible sin doble validación.</p>
+
+<div>
+<p><strong>El límite va en la ruta, no en el handler ni como middleware global.</strong>
+Solo este endpoint recibe contraseñas. Un límite global frenaría también <code>GET /api/user</code>,
+que es justo lo que un cliente activo hace sin parar en cada request.</p>
+</div>
+
+
+<h2 id="ttl">7. Caducidad: por qué NOT NULL</h2>
+
+<p>Esta mitad del capítulo Laravel ya venía hecha: desde el capítulo 1, <code>expires_at</code>
+es <strong>NOT NULL</strong> y la emisión no admite token sin TTL. Conviene dejar aquí el porqué,
+porque es la misma clase de decisión:</p>
+
+<pre><code># Opción A — la habitual: opcional, y confiar en que se rellene
+expires_at: Mapped[datetime | None]
+
+# Opción B — la elegida: imposible olvidar la caducidad
+expires_at: Mapped[datetime]            # NOT NULL, sin valor por defecto
+security.expiry()                       # obligatorio en la emisión</code></pre>
+
+<p>Un token sin caducidad es un token robado que sirve para siempre. Con la opción A bastaba
+crear una fila sin <code>expires_at</code> y nacía un token eterno, sin que nada fallara ni
+avisara. Con la B el error no se puede cometer, y la consulta de validación no necesita el
+<code>whereNull(...)-&gt;orWhere(...)</code> que en la opción A es exactamente el tipo de
+condición que se olvida revisar en una refactorización — su error sería <em>aceptar tokens
+que deberían haber caducado</em>.</p>
+
+
+<h2 id="logs">8. Qué se registra y qué no</h2>
+
+<p>Cada intento fallido deja un warning:</p>
+
+<pre><code># stderr del user-service
+WARNING:user-service:Failed login attempt {"email": "ana.torres@example.com", "ip": "127.0.0.1", "account_exists": true}
+WARNING:user-service:Failed login attempt {"email": "nadie@example.com", "ip": "127.0.0.1", "account_exists": false}</code></pre>
+
+<p>Y también las operaciones que cambian el estado de un token:</p>
+
+<pre><code>INFO:user-service:API token issued {"user_id": 1, "device": "api-token", "expires_at": "2026-11-11T11:34:07.729129+00:00"}
+INFO:user-service:API token revoked {"user_id": 1, "device": "api-token"}</code></pre>
+
+<h3>Por qué registrar <code>account_exists</code></h3>
+
+<p>La respuesta al cliente es idéntica en ambos casos ("Credenciales inválidas", 401), y tiene que
+serlo: si no, el endpoint sirve para enumerar qué emails están dados de alta.</p>
+
+<p>Pero en el <em>log</em> la información sí es útil: un pico de intentos con
+<code>account_exists: true</code> contra muchos emails distintos es la firma de credential
+stuffing, y es justo lo que se quiere poder detectar.</p>
+
+<h3>Por qué no se registra la contraseña</h3>
+
+<p>Nunca. Y no es una convención: hay un test que lo comprueba.</p>
+
+<pre><code>def test_nunca_registra_la_contrasena(caplog):
+    seed_two_users()
+    with caplog.at_level(logging.WARNING, logger="user-service"):
+        with client() as c:
+            _login(c, password="mi-secreto-muy-largo")
+    assert "mi-secreto-muy-largo" not in caplog.text</code></pre>
+
+<div>
+<p><strong>El riesgo de escribir contraseñas en el log es subestimado.</strong> Los logs suelen
+tener permisos más laxos que la base de datos, se copian a agregadores de terceros, y se
+conservan meses. Un log de autenticaciones es material de credential stuffing listo para usar.</p>
+</div>
+
+
+<h2 id="verificacion">9. Verificación real</h2>
+
+<h3>Fuerza bruta contra una cuenta</h3>
+
+<pre><code>$ for i in $(seq 1 9); do curl -X POST .../api/tokens -d '{...}'
+  intento 1 -&gt; 401
+  intento 2 -&gt; 401
+  intento 3 -&gt; 401
+  intento 4 -&gt; 401
+  intento 5 -&gt; 401
+  intento 6 (CONTRASEÑA CORRECTA) -&gt; 429 + Retry-After: 60
+  intento 7 -&gt; 429
+  intento 8 -&gt; 429
+  intento 9 -&gt; 429</code></pre>
+
+<pre><code>[■][■][■][■][■][ ][ ][ ][ ]
+ 401 401 401 401 401 429 429 429 429
+
+■ = intento aceptado por el limitador (credencial incorrecta, 401)
+  = bloqueado (429 Too Many Requests)</code></pre>
+
+<p>El intento 6 llevaba la contraseña correcta, y el límite lo bloqueó igual: los contadores
+cuentan todos los intentos. Un límite que solo frena los fallos es decorativo.</p>
+
+<h3>Barrido contra 24 cuentas distintas desde una IP</h3>
+
+<pre><code>401 401 401 401 401 401 401 401 401 401 401 401 401 401 401 401 401 401 401 401
+429 429 429 429</code></pre>
+
+<p>Cada intento usa una cuenta diferente, así que el límite por cuenta nunca se agota. El de IP
+es el que corta, exactamente al llegar a 20. En el log quedaron los 20 con
+<code>account_exists: false</code>.</p>
+
+<h3>Cuánto protege en números</h3>
+
+<pre><code>$ 50 intentos medidos antes del cambio: 50 intentos en 0.81 s -&gt; ~3 700 req/min
+$ 50 intentos medidos después:          50 intentos en 0.43 s
+  de los cuales SOLO 20 tocaron contraseñas; los 30 restantes fueron 429 instantáneos</code></pre>
+
+<p>El atacante sigue teniendo velocidad de máquina, pero su presupuesto de contraseñas por
+minuto baja de 3 700 a 20 (por IP) o 5 (por cuenta). Eso es lo que hace descartable la fuerza
+bruta contra una contraseña elegida por humanos.</p>
+
+<h3>Efecto en el otro servicio</h3>
+
+<p>El task-service no necesitó cambios: su frontera ya traducía el 401 a "Token inválido o
+expirado". Comprobado en vivo:</p>
+
+<pre><code>login correcto -&gt; 201
+GET /api/tasks con el token (via task-service) -&gt; 200
+POST /api/tokens con el presupuesto IP agotado -&gt; 429   # el login, no el uso del token</code></pre>
+
+<p>Y ese último punto marca la frontera del cambio: el límite protege la <em>emisión</em> de
+tokens, no el <em>uso</em>. Con un token válido en mano, seguir usándolo no cuenta en ningún
+contador — el límite del login solo existe porque el login es lo único que expone contraseñas.</p>
+
+
+<h2 id="errores">10. Tres errores al implementarlo</h2>
+
+<p>Los tres aparecieron en la suite mientras se implementaba, no después.</p>
+
+<h3>10.1 El test que contó el token de otro test</h3>
+
+<p>"Un intento fallido no emite ningún token" contaba <code>ApiToken.count()</code> y dio más
+de cero. El intento fallido no emitía nada — el token era de <strong>un test anterior</strong>,
+que había hecho un login correcto y dejado su fila en la base de datos compartida
+(<code>:memory:</code> con <code>StaticPool</code> persiste entre tests).</p>
+
+<p><strong>La solución:</strong> el seed de los tests borra también las filas de
+<code>api_tokens</code>, igual que borra los usuarios. Es el mismo principio de la fixture
+autouse que limpia los overrides de identidad y los contadores del limitador: <em>nadie
+arrasta estado del test anterior</em>.</p>
+
+<h3>10.2 La aserción que peleaba con el formato del JSON</h3>
+
+<p>El test del log pedía exactamente <code>"account_exists":true</code> y el <code>json.dumps</code>
+produce <code>"account_exists": true</code> (con espacio). La información era correcta; la
+aserción peleaba con el separador por defecto en vez de comprobar lo que importa: que el email
+está, que la IP está, que la existencia de la cuenta está.</p>
+
+<div>
+<p><strong>La lección:</strong> una aserción sobre formato exacto es frágil por definición.
+Comprueba los campos que importan, no el espaciado de la serialización.</p>
+</div>
+
+<h3>10.3 Los logs que "ya estaban" y nadie veía</h3>
+
+<p>El <code>log.info("API token issued", ...)</code> existía y el grep del E2E no lo encontraba.
+Causa: sin un handler configurado, Python descarta todo lo que es INFO (el último recurso de
+logging solo emite WARNING en adelante). El registro estaba escrito, pero en producción virtual
+iba a ninguna parte.</p>
+
+<p><strong>La solución:</strong> <code>logging.basicConfig(level=logging.INFO)</code> en
+<code>main.py</code>, con un comentario de por qué existe. Es la versión Python del "wrote the
+log but forgot the sink" — el mensaje existe, el destinatario no.</p>
+
+
+<h2 id="proxies">11. La trampa de los proxies</h2>
+
+<p>El límite por IP usa la IP del <strong>socket</strong> (<code>request.client.host</code>),
+no de las cabeceras. Es la decisión correcta por defecto — <code>X-Forwarded-For</code> se
+escribe a mano con un curl — pero tiene la trampa de siempre en el otro extremo:</p>
+
+<pre><code>$ curl -H "X-Forwarded-For: 203.0.113.9" -X POST .../api/tokens ...
+  401     # la cabecera se ignoró: contó como 127.0.0.1 otra vez (correcto)</code></pre>
+
+<p>La consecuencia en producción es seria y silenciosa: si el servicio corre detrás de un
+balanceador o un ingress, <strong>todas</strong> las peticiones llegan con la IP del proxy, y
+el límite por IP se convierte en un límite global compartido. Con veinte intentos de login en
+todo el sistema, se bloquea a todo el mundo.</p>
+
+<pre><code># uvicorn sabe leer el header real, pero SOLO de IPs proxy declaradas:
+$ uvicorn app.main:app --port 8000 --proxy-headers \
+    --forwarded-allow-ips "10.0.0.5"   # la IP de tu proxy, no "*"</code></pre>
+
+<p>No se activó en este proyecto a propósito: no hay proxy en local, y activarlo con
+<code>*</code> reabriría exactamente la puerta que cerramos (cualquiera puede falsificar
+<code>X-Forwarded-For</code> si el servidor confía en cualquiera). Es <strong>el primer paso
+antes de desplegar</strong>, y conviene dejarlo anotado junto al límite, no descubrirlo en
+producción.</p>
+
+
+<h2 id="tests">12. Cobertura de tests</h2>
+
+<p>Diez tests solo para este cambio, en <code>tests/test_login_throttle.py</code>:</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Qué comprueba</th><th>Por qué importa</th></tr>
+<tr>
+<td>Bloquea tras el límite de cuenta (6to intento → 429)</td>
+<td>Que el número configurado sea el real, no un <code>if</code> decorativo</td>
+</tr>
+<tr>
+<td>El 429 lleva <code>Retry-After</code></td>
+<td>Que el bloqueo sea usable por un cliente correcto, no un muro mudo</td>
+</tr>
+<tr>
+<td>Cada cuenta tiene su presupuesto</td>
+<td>Que bloquear a Ana no castigue a Luis desde la misma IP</td>
+</tr>
+<tr>
+<td>Las IP no comparten presupuesto</td>
+<td>Que otra IP arranque con presupuesto fresco (y que la clave por cuenta lo lleve)</td>
+</tr>
+<tr>
+<td>Un barrido de muchas cuentas se corta en 20</td>
+<td>Que el límite por IP funcione cuando el de cuenta no puede activarse</td>
+</tr>
+<tr>
+<td>Bloquea también la contraseña correcta</td>
+<td>Un límite que solo frena los fallos es decorativo: basta acertar en el intento 21</td>
+</tr>
+<tr>
+<td>Nunca emite token en un fallo</td>
+<td>Que el 401 no deje nada detrás</td>
+</tr>
+<tr>
+<td>Registra email, IP y existencia de la cuenta</td>
+<td>Que la detección de credential stuffing tenga datos</td>
+</tr>
+<tr>
+<td>Nunca registra la contraseña</td>
+<td>Que el log no se convierta en material de robo</td>
+</tr>
+<tr>
+<td>Los límites vienen de la configuración</td>
+<td>Que el env y los defaults sean los declarados (5 / 20 / 60)</td>
+</tr>
+</table>
+
+<p>La fixture autouse <code>limitador_limpio</code> resetea los contadores antes y después de
+cada test: ningún test hereda el presupuesto gastado del anterior.</p>
+
+<p>Suite completa tras el cambio: <strong>user-service 17 tests</strong> y
+<strong>task-service 11 tests</strong>, los dos en verde.</p>
+
+
+<h2 id="pendiente">13. Lo que queda abierto</h2>
+
+<ul>
+<li><strong>Contadores en memoria del proceso.</strong> La cola de hits vive en el proceso
+    de uvicorn. Con una sola instancia, es lo correcto; con N réplicas, el atacante dispone de
+    N presupuestos. En producción, contadores compartidos (Redis) o un proxy delante que ya
+    limite. <em>Es la más importante de la lista:</em> un rate limit en memoria local solo
+    protege cuando hay una sola instancia.</li>
+<li><strong>Sin límite global de peticiones.</strong> Ahora solo se protege el login. Un
+    atacante podría martillear <code>GET /api/user</code> sin consecuencias.</li>
+<li><strong>Sin bloqueo de cuenta.</strong> El rate limit frena el ritmo, pero no invalida la
+    cuenta. En muchos sistemas eso es justo lo que se quiere: un atacante lento no se ve
+    afectado y el usuario legítimo tampoco.</li>
+<li><strong>Sin aviso al usuario legítimo.</strong> La respuesta 429 dice "demasiados intentos"
+    y cuánto falta (<code>Retry-After</code>), pero una UI real explicaría qué pasó y qué hacer.</li>
+<li><strong>Sin refresh tokens.</strong> Cuando el token caduca (60 min), el usuario vuelve a
+    escribir su contraseña — y con el presupuesto por cuenta, una mala suerte repetida puede
+    toparse con el límite. El sitio está previsto: <code>POST /api/tokens/refresh</code>,
+    cambiar el token caducado por uno nuevo.</li>
+</ul>
+
+<div>
+<p><strong>La de contadores por proceso es la más importante.</strong> Es el error que hace que
+un sistema desplegado con varias réplicas crea estar protegido y no lo esté: cada réplica le
+regala al atacante un presupuesto entero de contraseñas.</p>
+</div>
+
+<hr>
+
+<footer>
+<p><em>Nota:</em> los contadores viven en <code>app/rate_limit.py</code>, la configuración en
+<code>app/config.py</code> (env <code>LOGIN_THROTTLE_*</code>), el límite se aplica como
+dependencia en la ruta <code>POST /api/tokens</code>, y el registro de intentos en
+<code>routes_tokens.issue_token()</code>. Todo está en el user-service porque es el único que
+recibe contraseñas: el task-service no tiene ni usuario ni contraseña que proteger.</p>
+</footer>
+
+</article>
+
+</body>
+</html>

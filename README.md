@@ -1,7 +1,8 @@
 # demo-microservicios (formato FastAPI)
 
-El mismo proyecto de la serie, escrito en FastAPI. Capítulo 1: dos servicios,
-tokens opacos y la frontera HTTP en un solo sitio.
+El mismo proyecto de la serie, escrito en FastAPI. Capítulos 1–3: dos
+servicios, tokens opacos, la frontera HTTP en un solo sitio y el rate limit
+del login.
 
 ## Servicios
 
@@ -49,7 +50,9 @@ curl -X DELETE http://127.0.0.1:8000/api/tokens -H "Authorization: Bearer $TOKEN
 
 - `POST /api/tokens` — 201 con el token (el crudo sale una vez, en la BD
   queda solo su hash sha256); credenciales malas o email fantasma: mismo 401
-  `Credenciales inválidas` (anti-enumeración).
+  `Credenciales inválidas` (anti-enumeración). Rate limit (capítulo 3):
+  5/min por cuenta (clave email+IP) y 20/min por IP, cuenta todos los
+  intentos; al agotarse, 429 con header `Retry-After`.
 - `GET /api/user` — 200 `{id, name, email}` o 401.
 - `DELETE /api/tokens` — 204; revocación real: la fila se borra y el token
   muere en todos los servicios al instante.
@@ -70,11 +73,17 @@ El resto del servicio recibe el usuario como si fuera local.
 
 - `docs/01-estructura-base.html` — capítulo 1: dos servicios, tokens opacos
   y la frontera HTTP (deck navegable con ← → y version imprimible).
+- `docs/02-flujo-autenticacion.html` — capítulo 2: el flujo de autenticación
+  en detalle (artículo: código real, matriz de respuestas, latencia medida,
+  alternativas y límites).
+- `docs/03-rate-limit.html` — capítulo 3: el rate limit del login, el antes
+  y el después (artículo: mediciones reales, los dos límites, los logs y los
+  tres errores que aparecieron al implementarlo).
 
 ## Tests
 
 ```bash
-cd user-service && uv run pytest   # 7 tests, TestClient + :memory:
+cd user-service && uv run pytest   # 17 tests, TestClient + :memory:
 cd task-service && uv run pytest   # 11 tests, dependency_overrides + stubs
 ```
 

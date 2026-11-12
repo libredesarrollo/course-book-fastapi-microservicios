@@ -1,10 +1,6 @@
 from tests.conftest import client, seed_two_users
 
 
-def setUp() -> None:
-    pass
-
-
 def _login(c, email: str = "ana.torres@example.com", password: str = "password"):
     return c.post(
         "/api/tokens",
@@ -44,4 +40,6 @@ def test_token_repetido_no_nace_del_mismo_hash():
         first = _login(c).json()["token"]
         second = _login(c).json()["token"]
     assert first != second
-    assert hashlib.sha256(first.encode()).hexdigest()  # y el hash del otro no encaja
+    assert hashlib.sha256(first.encode()).hexdigest() != hashlib.sha256(
+        second.encode()
+    ).hexdigest()

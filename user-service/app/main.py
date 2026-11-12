@@ -1,9 +1,14 @@
 from contextlib import asynccontextmanager
+import logging
 
 from fastapi import FastAPI
 
 from app.db import Base, engine
 from app.routes_tokens import router as tokens_router
+
+# Sin esto, los INFO (token emitido, revocado) van a ninguna parte: el
+# logger de uvicorn solo se trae los WARNING en adelante.
+logging.basicConfig(level=logging.INFO)
 
 
 @asynccontextmanager
