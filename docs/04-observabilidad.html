@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>Observabilidad: correlation ID, health checks y trazabilidad</title>
+</head>
+<body>
+
+<article>
+
+<header>
+<h1>Observabilidad entre microservicios: correlation ID, health checks y trazabilidad</h1>
+
+<p><strong>Resumen:</strong> al pasar de dos aplicaciones aisladas a dos microservicios que se llaman por HTTP, la pregunta deja de ser "¿ha funcionado?" para pasar a ser "<strong>¿qué petición ha provocado este error?</strong>". Para responderla hay que poder seguir un único identificador a lo largo de toda la cadena. Este capítulo recoge lo que acabamos de implementar en la versión FastAPI: <code>X-Request-Id</code>, health checks, propagación entre servicios y <strong>logs correlacionados</strong>.</p>
+
+<p>Contexto: proyecto <code>demo-microservicios</code> con <code>user-service</code> (FastAPI, puerto 8000) y <code>task-service</code> (FastAPI, puerto 8001), comunicación HTTP síncrona y autenticación delegada.</p>
+</header>
+
+<nav>
+<h2>Contenido</h2>
+<ol>
+<li><a href="#problema">El problema: peticiones sin rastro</a></li>
+<li><a href="#objetivo">Objetivo del capítulo</a></li>
+<li><a href="#request-id">1. Correlation ID: X-Request-Id</a></li>
+<li><a href="#middleware">2. El middleware en app/observability.py</a></li>
+<li><a href="#logs-contexto">3. Logs con contexto: ContextVar + Filter</a></li>
+<li><a href="#health">4. Health checks</a></li>
+<li><a href="#propagacion">5. Propagación al user-service desde task-service</a></li>
+<li><a href="#verificacion">6. Comprobación en vivo</a></li>
+<li><a href="#tests">7. Tests</a></li>
+<li><a href="#por-que">8. ¿Por qué antes de reintentos?</a></li>
+<li><a href="#archivos">9. Archivos añadidos o modificados</a></li>
+<li><a href="#estado">10. Estado actual</a></li>
+</ol>
+</nav>
+
+<hr>
+
+<h2 id="problema">1. El problema: peticiones sin rastro</h2>
+
+<p>En una app monolítica basta con abrir la salida de uvicorn y filtrar por ruta. En microservicios la realidad es otra:</p>
+
+<ul>
+<li><strong>Una acción del cliente</strong> contra el <code>task-service</code> provoca una llamada interna a <code>GET /api/user</code> del <code>user-service</code> en cada petición autenticada.</li>
+<li><strong>Si falla la red</strong>, el <code>503</code> aparece solo en los logs del <code>task-service</code>, pero <strong>¿qué cliente lo provocó?</strong> no se sabe.</li>
+<li><strong>Si hay varios usuarios en paralelo</strong>, las líneas se entremezclan y resulta imposible reconstruir el camino completo.</li>
+</ul>
+
+<p>Sin un identificador común, depurar entre dos servicios es adivinar.</p>
+
+<h2 id="objetivo">2. Objetivo del capítulo</h2>
+
+<p>El objetivo no es instrumentación completa con OpenTelemetry. Es algo mucho más práctico:</p>
+
+<ol>
+<li><strong>Poder trazar una petición</strong> desde que llega al <code>task-service</code> hasta la llamada que hace al <code>user-service</code>, con el mismo ID.</li>
+<li><strong>Saber si los servicios están vivos</strong> sin necesidad de autenticar.</li>
+<li><strong>Propagar la traza</strong> entre ambos servicios por HTTP.</li>
+<li><strong>Correlacionar los logs</strong> para poder filtrar por <code>request_id</code> y seguir el recorrido completo.</li>
+</ol>
+
+<h2 id="request-id">3. Correlation ID: X-Request-Id</h2>
+
+<p>La convención es la misma de la serie: usar la cabecera HTTP <code>X-Request-Id</code>.</p>
+
+<ul>
+<li><strong>Si llega del cliente (o del servicio que nos llama)</strong>: se respeta. No se genera uno nuevo.</li>
+<li><strong>Si no llega</strong>: se genera un UUID v4 con <code>uuid.uuid4()</code>.</li>
+<li><strong>Siempre se devuelve</strong> en la respuesta con la misma cabecera <code>X-Request-Id</code>.</li>
+</ul>
+
+<p>Así, cualquier herramienta, proxy o el propio desarrollador puede pasar ese ID y el sistema lo mantendrá durante toda la cadena.</p>
+
+<h2 id="middleware">4. El middleware en app/observability.py</h2>
+
+<p>Toda la pieza vive en un solo módulo por servicio: <code>app/observability.py</code>. Los dos
+servicios son proyectos <code>uv</code> independientes y no comparten código (no hay
+equivalente al paquete de Composer de la serie Laravel), así que el módulo va duplicado
+en cada servicio — igual que ya lo están <code>db.py</code> y <code>config.py</code>.</p>
+
+<pre><code>class RequestIdMiddleware(BaseHTTPMiddleware):
+    async def dispatch(
+        self, request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        rid = request.headers.get(REQUEST_ID_HEADER) or str(uuid.uuid4())
+        token = request_id.set(rid)
+        try:
+            response = await call_next(request)
+        finally:
+            request_id.reset(token)
+        response.headers[REQUEST_ID_HEADER] = rid
+        return response
+</code></pre>
+
+<p>Tres decisiones que valen la pena nombrar:</p>
+
+<ul>
+<li><strong>El ID vive en un <code>ContextVar</code></strong>, no en la request: cualquier código de la petición lo lee sin tener que arrastrar el objeto <code>Request</code> — y las llamadas salientes (que no reciben la request) lo ven igual.</li>
+<li><strong>El <code>reset()</code> va en el <code>finally</code></strong>: si la petición revienta, el contexto no se queda contaminado para la siguiente.</li>
+<li><strong>Se fija antes de <code>call_next</code></strong> porque es lo que hace que el <code>ContextVar</code> alcance hasta los endpoints síncronos (el threadpool de Starlette hereda el contexto tal como está en ese momento).</li>
+</ul>
+
+<p>Se monta con <code>app.add_middleware(RequestIdMiddleware)</code> en el <code>main.py</code> de cada servicio.</p>
+
+<h2 id="logs-contexto">5. Logs con contexto: ContextVar + Filter</h2>
+
+<p>Sin contexto, los logs eran así:</p>
+
+<pre><code>WARNING:user-service:Failed login attempt {"email":"ana.torres@example.com","ip":"127.0.0.1","account_exists":true}
+</code></pre>
+
+<p>El <code>request_id</code> no aparece, así que no se puede cruzar con la respuesta HTTP ni con los logs del otro servicio. El equivalente en Python del <code>Log::withContext()</code> de Laravel es un filtro de logging que lee el <code>ContextVar</code>:</p>
+
+<pre><code>class RequestIdFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = request_id.get() or "-"
+        return True
+
+
+class RequestIdFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        if not hasattr(record, "request_id"):
+            record.request_id = "-"
+        return super().format(record)
+
+
+def configure_logging(*loggers: str) -> None:
+    logging.basicConfig(level=logging.INFO)
+    formatter = RequestIdFormatter(
+        "%(levelname)s:%(name)s:%(message)s request_id=%(request_id)s"
+    )
+    for handler in logging.getLogger().handlers:
+        handler.setFormatter(formatter)
+    for name in loggers:
+        logging.getLogger(name).addFilter(RequestIdFilter())
+</code></pre>
+
+<p>Dos detalles de diseño:</p>
+
+<ul>
+<li><strong>El filtro va en el logger, no en el handler.</strong> Los filtros de un handler no alcanzan a los records que captura <code>caplog</code> en los tests; los del logger sí se aplican a cada record antes de que salga a cualquier handler.</li>
+<li><strong>El formatter completa con <code>"-"</code></strong> los records que no nacieron dentro de una petición (arranque, seed, logs de librerías). Sin ese default, cualquier log de <code>httpx2</code> rompería el formato con un <code>KeyError</code>.</li>
+</ul>
+
+<p>Y en el <code>main.py</code> de cada servicio, una sola línea sustituye al <code>basicConfig</code> suelto:</p>
+
+<pre><code>configure_logging("user-service")   # en el task-service: configure_logging("task-service")
+</code></pre>
+
+<p>Los mensajes de negocio no cambiaron: siguen llevando sus campos como JSON en el propio mensaje. El <code>request_id</code> se añade solo, al final de cada línea.</p>
+
+<h2 id="health">6. Health checks</h2>
+
+<p>Se ha añadido un <code>GET /health</code> público en los dos servicios, sin autenticación:</p>
+
+<pre><code>@app.get("/health")
+def health() -> dict[str, str]:
+    return {
+        "status": "ok",
+        "service": "user-service",
+        "timestamp": datetime.now(UTC).isoformat(),
+    }
+</code></pre>
+
+<div>
+<p><strong>El payload es estático a propósito.</strong> Un health check no debe depender de la base de datos, porque el caso interesante es justo el de la base de datos caída: si consultara la base de datos para saber si está bien, no podría distinguir "estoy vivo pero sin base de datos" de "estoy muerto", y el balanceador necesita esa diferencia.</p>
+</div>
+
+<h2 id="propagacion">7. Propagación al user-service desde task-service</h2>
+
+<p>El <code>task-service</code> llama al <code>user-service</code> en cada petición autenticada: <code>verify_token()</code> → <code>GET /api/user</code>. Toda la frontera vive en un solo archivo, <code>task-service/app/user_service_client.py</code>, así que la propagación va ahí:</p>
+
+<pre><code>def _trace_headers() -> dict[str, str]:
+    """Propaga el correlation ID que llegó del cliente, para que la misma
+    petición pueda seguirse en los logs de los dos servicios."""
+    rid = request_id.get()
+    return {REQUEST_ID_HEADER: rid} if rid else {}
+
+
+def verify_token(token: str) -> dict[str, Any]:
+    try:
+        resp = _http_get(
+            f"{config.USER_SERVICE_URL}/api/user",
+            headers={"Authorization": f"Bearer {token}", **_trace_headers()},
+        )
+    ...
+</code></pre>
+
+<p>De paso, la frontera dejó de fallar en silencio. Los tres caminos de error ahora dejan warning antes de responder:</p>
+
+<ul>
+<li><code>ConnectError</code>/<code>ConnectTimeout</code> → <code>user-service unreachable {"base_url": ..., "path": "/api/user"}</code> antes del 503.</li>
+<li><code>401</code> del IdP → <code>Token rejected by user-service</code> antes del 401 local.</li>
+<li>Status inesperado → <code>Unexpected response from user-service {"status": ...}</code> antes del 502.</li>
+</ul>
+
+<p>Nunca se loguea el token en sí: solo que fue presentado y rechazado. El <code>request_id</code> va aparte, metido por el filtro.</p>
+
+<h2 id="verificacion">8. Comprobación en vivo</h2>
+
+<p>Con ambos servidores arrancados en local:</p>
+
+<pre><code>$ curl -si http://127.0.0.1:8000/health | grep -i x-request-id
+x-request-id: a4a11e95-9f7c-4c33-a58f-8dcdbdf21c7b
+
+$ curl -si -H "X-Request-Id: prueba-trazabilidad-123" http://127.0.0.1:8001/health | grep -i x-request-id
+x-request-id: prueba-trazabilidad-123
+</code></pre>
+
+<p>Si se pasa un ID explícito, se mantiene. Al pedir una tarea con un token podrido, ese mismo ID viaja al <code>user-service</code> en la llamada de <code>verify_token</code> — y aparece <strong>dentro del log</strong> del servicio que rechazó:</p>
+
+<pre><code>$ curl -s -H "X-Request-Id: traza-e2e-001" -H "Authorization: Bearer token-podrido" http://127.0.0.1:8001/api/tasks
+
+WARNING:task-service:Token rejected by user-service request_id=traza-e2e-001
+</code></pre>
+
+<p>Y el caso que abre el capítulo — el IdP caído — deja la respuesta a "¿qué cliente lo provocó?":</p>
+
+<pre><code>WARNING:task-service:user-service unreachable {"base_url": "http://127.0.0.1:8000", "path": "/api/user"} request_id=...
+</code></pre>
+
+<p>El otro lado cuenta su parte con el mismo ID:</p>
+
+<pre><code>$ curl -s -X POST -H "X-Request-Id: traza-e2e-001" -H "Content-Type: application/json" \
+    -d '{"email":"ana.torres@example.com","password":"mala"}' http://127.0.0.1:8000/api/tokens
+
+WARNING:user-service:Failed login attempt {"email": "ana.torres@example.com", "ip": "127.0.0.1", "account_exists": true} request_id=traza-e2e-001
+</code></pre>
+
+<p>Con ese <code>request_id</code> se puede filtrar en la salida de los dos servicios y reconstruir la petición completa:</p>
+
+<pre><code>$ grep "traza-e2e-001" /tmp/uvicorn-8000.log /tmp/uvicorn-8001.log
+</code></pre>
+
+<h2 id="tests">9. Tests</h2>
+
+<p>Un archivo nuevo por servicio, <code>tests/test_observability.py</code>, fija el contrato completo:</p>
+
+<ul>
+<li><strong>user-service (4 tests)</strong>: health sin autenticar ni tocar la BD, ID generado es UUID v4, el ID del cliente se respeta, y el <code>request_id</code> llega al record de <code>Failed login attempt</code>.</li>
+<li><strong>task-service (5 tests)</strong>: health sin autenticar, el ID del cliente se respeta, el ID del cliente y el generado se propagan en la llamada saliente (capturando las cabeceras que recibe <code>_http_get</code>), y el <code>request_id</code> llega al warning <code>user-service unreachable</code> cuando el IdP está caído.</li>
+</ul>
+
+<p>El test del filtro merece una mención: <code>caplog</code> captura los records en un handler propio, así que un filtro colgado del handler no lo vería. Por eso el <code>RequestIdFilter</code> va en el logger — y por eso el test puede asertar directamente <code>record.request_id == "traza-e2e-002"</code>.</p>
+
+<h2 id="por-que">10. ¿Por qué antes de reintentos?</h2>
+
+<p>En <code>user_service_client.py</code> está previsto añadir reintentos ante errores de red. Eso está bien, pero tiene un problema sin trazabilidad:</p>
+
+<ul>
+<li><strong>Sin contexto:</strong> <code>ConnectError</code> → <strong>¿es el primer intento o el tercero?</strong> Difícil de distinguir.</li>
+<li><strong>Con <code>request_id</code> en los logs:</strong> verás las N líneas con el <strong>mismo <code>request_id</code></strong> y sabrás que son reintentos de la misma petición.</li>
+<li><strong>Con propagación cruzada:</strong> también podrás buscar ese <code>request_id</code> en el log del <code>user-service</code> y ver si llegó alguna vez o si nunca salió del <code>task-service</code>.</li>
+</ul>
+
+<p>Por eso se ha optado por <strong>logs con contexto</strong> antes que reintentos. Es el orden correcto para poder depurar lo que venga después.</p>
+
+<h2 id="archivos">11. Archivos añadidos o modificados</h2>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Archivo</th><th>Acción</th><th>Descripción</th></tr>
+<tr>
+<td><code>user-service/app/observability.py</code></td>
+<td>Añadido</td>
+<td>Middlewares, <code>ContextVar</code>, filtro y formatter del <code>request_id</code></td>
+</tr>
+<tr>
+<td><code>task-service/app/observability.py</code></td>
+<td>Añadido</td>
+<td>Copia exacta del módulo (servicios uv independientes, sin código compartido)</td>
+</tr>
+<tr>
+<td><code>user-service/app/main.py</code></td>
+<td>Modificado</td>
+<td><code>configure_logging()</code>, <code>add_middleware</code> y ruta pública <code>GET /health</code></td>
+</tr>
+<tr>
+<td><code>task-service/app/main.py</code></td>
+<td>Modificado</td>
+<td><code>configure_logging()</code>, <code>add_middleware</code> y ruta pública <code>GET /health</code></td>
+</tr>
+<tr>
+<td><code>task-service/app/user_service_client.py</code></td>
+<td>Modificado</td>
+<td>Propagación del <code>X-Request-Id</code> (<code>_trace_headers()</code>) y warnings en los tres caminos de error de la frontera</td>
+</tr>
+<tr>
+<td><code>user-service/tests/test_observability.py</code></td>
+<td>Añadido</td>
+<td>4 tests: health, cabeceras y <code>request_id</code> en los logs de negocio</td>
+</tr>
+<tr>
+<td><code>task-service/tests/test_observability.py</code></td>
+<td>Añadido</td>
+<td>5 tests: health, cabeceras, propagación y <code>request_id</code> en los logs de la frontera</td>
+</tr>
+</table>
+
+<h2 id="estado">12. Estado actual</h2>
+
+<p>Tras implementar lo anterior:</p>
+
+<ul>
+<li><strong>Tests:</strong> user-service <strong>21 tests</strong> — OK. task-service <strong>16 tests</strong> — OK.</li>
+<li><strong>Operabilidad:</strong> ya se puede obtener <code>X-Request-Id</code> en todas las respuestas, propagado entre servicios.</li>
+<li><strong>Trazabilidad:</strong> el mismo ID aparece en los logs de los dos servicios; los tres errores de la frontera dejan warning propio en el task-service.</li>
+<li><strong>Health:</strong> <code>GET /health</code> público en los dos puertos, payload estático, sin BD ni autenticación.</li>
+<li><strong>Pendiente:</strong> reintentos ante errores de red en el cliente HTTP, que ahora se pueden depurar con el <code>request_id</code>.</li>
+</ul>
+
+<hr>
+
+<footer>
+<p><em>Nota:</em> el módulo vive en <code>app/observability.py</code> de cada servicio (duplicado porque los proyectos uv no comparten código), la propagación en <code>task-service/app/user_service_client.py</code>, y la única pieza que toca el <code>main.py</code> de cada app son tres líneas: <code>configure_logging()</code>, <code>add_middleware</code> y el <code>GET /health</code>.</p>
+</footer>
+
+</article>
+
+</body>
+</html>

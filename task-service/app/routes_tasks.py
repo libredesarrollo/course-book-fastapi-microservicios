@@ -1,4 +1,6 @@
+import json
 from fastapi import APIRouter, Depends, HTTPException
+import logging
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -9,6 +11,7 @@ from typing import Any
 
 router = APIRouter(prefix="/api", tags=["tasks"])
 
+log = logging.getLogger("task-service")
 
 def find_owned(task_id: int, current_user: dict[str, Any], db: Session) -> Task:
     task = db.get(Task, task_id)
@@ -43,6 +46,17 @@ def list_tasks(
     current_user: dict[str, Any] = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> list[Task]:
+
+    log.info(
+        "Failed login attempt %s",
+        json.dumps(
+            {
+                "task": "ok",
+            },
+            ensure_ascii=False,
+        ),
+    )
+    
     return list(
         db.query(Task)
         .filter(Task.user_id == current_user["id"])

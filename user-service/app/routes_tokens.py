@@ -86,6 +86,16 @@ def issue_token(
 
 @router.get("/user", response_model=UserInfo)
 def whoami(user: User = Depends(require_user)) -> UserInfo:
+    log.info(
+        "API token issued %s",
+        json.dumps(
+            {
+                "user_id": user.id,
+                "name": user.name
+            },
+            ensure_ascii=False,
+        ),
+    )
     return UserInfo.model_validate(user)
 
 
