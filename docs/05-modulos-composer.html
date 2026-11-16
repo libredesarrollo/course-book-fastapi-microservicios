@@ -1,0 +1,570 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>Empaquetar el código común: una librería interna con uv</title>
+</head>
+<body>
+
+<article>
+
+<header>
+<h1>Empaquetar el código común: una librería interna empaquetada con uv</h1>
+
+<p><strong>Resumen:</strong> cuando dos microservicios comparten código, hay tres caminos: copiar y pegar, publicar en PyPI, o un <strong>paquete local instalado por ruta</strong>. Este capítulo explica el tercero: cómo se extrae el código duplicado a <code>packages/</code>, cómo se declara el <code>pyproject.toml</code> del paquete, cómo lo consumen las aplicaciones con <code>uv add --editable</code>, y por qué el resultado equivale al symlink de los repositorios <code>path</code> de Composer.</p>
+
+<p>Aplicado en el proyecto <code>demo-microservicios</code>, que tiene <code>user-service</code> y <code>task-service</code> con el módulo de observabilidad duplicado byte a byte.</p>
+</header>
+
+<nav>
+<h2>Contenido</h2>
+<ol>
+<li><a href="#problema">El problema: código duplicado</a></li>
+<li><a href="#opciones">Las tres opciones y por qué esta</a></li>
+<li><a href="#estructura">Estructura resultante</a></li>
+<li><a href="#paquete">El pyproject.toml del paquete</a></li>
+<li><a href="#namespace">El namespace: PEP 420 es el PSR-4 de Python</a></li>
+<li><a href="#app">El pyproject.toml de la aplicación</a></li>
+<li><a href="#editable">Por qué editable y no una copia</a></li>
+<li><a href="#health">add_health: el HealthController del paquete</a></li>
+<li><a href="#migracion">Migración paso a paso</a></li>
+<li><a href="#errores">El error que apareció al migrar</a></li>
+<li><a href="#lo-que-no-se-empaqueta">Lo que NO se empaquetó (y por qué)</a></li>
+<li><a href="#verificacion">Verificación</a></li>
+<li><a href="#segundo-paquete">El segundo paquete: el cliente del user-service (todavía no)</a></li>
+<li><a href="#comandos">Los comandos, de memoria</a></li>
+<li><a href="#manual">Crear el paquete a mano (referencia)</a></li>
+<li><a href="#estado">Estado actual</a></li>
+</ol>
+</nav>
+
+<hr>
+
+<h2 id="problema">1. El problema: código duplicado</h2>
+
+<p>El capítulo de observabilidad terminó con el mismo módulo viviendo en dos sitios:</p>
+
+<pre><code>user-service/app/observability.py    (~115 líneas)
+task-service/app/observability.py    (~115 líneas)   &lt;- idéntico, byte a byte</code></pre>
+
+<p>Y el endpoint de health también: el <code>GET /health</code> de los dos servicios difiere en un solo campo, el nombre.</p>
+
+<p>El problema real no es el tamaño:</p>
+
+<div>
+<p><strong>El problema real es la divergencia.</strong> Si mañana hay que cambiar el formato
+del <code>request_id</code>, hay que recordar cambiarlo en dos sitios. Si se cambia en uno y
+no en el otro, el <code>task-service</code> genera IDs con un formato y el
+<code>user-service</code> con otro. Y el síntoma aparece en producción, un martes, sin
+ningún test que lo detecte.</p>
+</div>
+
+<p>Ese es el momento en que el código duplicado deja de ser "un poco feo" y pasa a ser un <strong>riesgo operativo</strong>.</p>
+
+<h2 id="opciones">2. Las tres opciones y por qué esta</h2>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Opción</th><th>Ventajas</th><th>Inconvenientes</th></tr>
+<tr>
+<td><strong>A. Copiar y pegar</strong></td>
+<td>Cero infraestructura, funciona siempre</td>
+<td>Divergencia silenciosa. Es lo que acabamos de tener.</td>
+</tr>
+<tr>
+<td><strong>B. Publicar en PyPI</strong></td>
+<td>Instalable desde cualquier sitio, versionado de verdad</td>
+<td>Requiere cuenta, tokens, CI para publicar. Innecesario para un monorepo de 2 servicios.</td>
+</tr>
+<tr>
+<td><strong>C. Paquete local por ruta, editable</strong></td>
+<td>Versionable con Git, sin publicar nada, los cambios se ven al instante</td>
+<td>Hay que declararlo en el <code>pyproject.toml</code> de cada consumidor</td>
+</tr>
+</table>
+
+<p>Elegimos la <strong>C</strong>. En un monorepo es la opción estándar: se obtiene el beneficio de la modularidad (una sola copia del código, un solo sitio que cambiar) sin el coste de publicar nada.</p>
+
+<p>El equivalente exacto de los repositorios <code>path</code> de Composer en el mundo Python/uv es una <strong>dependencia editable por ruta</strong>: <code>[tool.uv.sources]</code> con <code>editable = true</code>. No es un workspace de uv: cada servicio sigue siendo un proyecto <code>uv</code> independiente con su propio <code>uv.lock</code>; solo comparten el paquete, como los servicios Laravel compartían el paquete por <code>vendor/</code>.</p>
+
+<h2 id="estructura">3. Estructura resultante</h2>
+
+<pre><code>demo-microservicios/
+├── packages/
+│   └── microservices-observability/
+│       ├── pyproject.toml          &lt;- el "composer.json" del paquete
+│       ├── README.md
+│       └── src/
+│           └── demo/
+│               └── microservices/
+│                   └── observability/
+│                       └── __init__.py     &lt;- TODO el código, en un solo sitio
+│
+├── user-service/
+│   ├── pyproject.toml              &lt;- + [tool.uv.sources], + dependency
+│   └── app/
+│       ├── main.py                 &lt;- 3 líneas: configure_logging, add_middleware, add_health
+│       └── (observability.py borrado)
+│
+└── task-service/
+    ├── pyproject.toml              &lt;- + [tool.uv.sources], + dependency
+    └── app/
+        ├── main.py                 &lt;- igual, con su nombre de servicio
+        ├── user_service_client.py  &lt;- se queda: consume el ContextVar del paquete
+        └── (observability.py borrado)</code></pre>
+
+<div>
+<p><strong>El principio de la estructura:</strong> en <code>packages/</code> va lo que es
+<em>compartido</em>; en <code>app/</code> va lo que es <em>de cada servicio</em>. Un paquete
+que solo usa un servicio no es un paquete: es código que se mudó de sitio sin ganancia.</p>
+</div>
+
+<h2 id="paquete">4. El pyproject.toml del paquete</h2>
+
+<p>Este es el de <code>packages/microservices-observability</code>, entero:</p>
+
+<pre><code>[project]
+name = "microservices-observability"
+version = "0.1.0"
+description = "Correlation ID, health check y logs con contexto para microservicios FastAPI (capítulo 5)"
+requires-python = ">=3.13"
+dependencies = [
+    "starlette>=0.40",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/demo"]
+</code></pre>
+
+<h3>Qué significa cada clave</h3>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Clave</th><th>Valor</th><th>Por qué</th></tr>
+<tr>
+<td><code>dependencies</code></td>
+<td>Solo <code>starlette</code></td>
+<td>El paquete usa <code>BaseHTTPMiddleware</code>, <code>Request</code>, <code>JSONResponse</code> y el router de Starlette. <strong>No declara <code>fastapi</code></strong>: no obliga a instalar el framework completo. Es el equivalente directo de declarar <code>illuminate/*</code> y no <code>laravel/framework</code> en el paquete Composer de la serie.</td>
+</tr>
+<tr>
+<td><code>build-system</code></td>
+<td><code>hatchling</code></td>
+<td>Quién convierte <code>src/</code> en un paquete instalable. Es el rol de <code>composer install</code> generando el autoloader.</td>
+</tr>
+<tr>
+<td><code>tool.hatch.build.targets.wheel.packages</code></td>
+<td><code>["src/demo"]</code></td>
+<td>El raíz del namespace: le dice a hatchling que empaquete <code>demo/</code> entero tal cual, sin crear paquetes fantasma.</td>
+</tr>
+<tr>
+<td><code>requires-python</code></td>
+<td><code>&gt;=3.13</code></td>
+<td>El mismo piso que los servicios de la serie.</td>
+</tr>
+</table>
+
+<h3>Qué contiene el paquete</h3>
+
+<ul>
+<li><code>RequestIdMiddleware</code>: respeta el <code>X-Request-Id</code> entrante o genera un UUID v4; siempre lo devuelve en la respuesta.</li>
+<li><code>request_id</code>: el <code>ContextVar</code> compartido que el middleware fija y que cualquier código de la petición lee (incluidas las llamadas salientes del task-service).</li>
+<li><code>RequestIdFilter</code> / <code>RequestIdFormatter</code> / <code>configure_logging</code>: el <code>request_id</code> en cada línea de log sin pasarlo a mano.</li>
+<li><code>add_health(app, service)</code>: publica el <code>GET /health</code> con payload estático.</li>
+<li><code>REQUEST_ID_HEADER</code>: la constante de la convención, en un solo sitio.</li>
+</ul>
+
+<h2 id="namespace">5. El namespace: PEP 420 es el PSR-4 de Python</h2>
+
+<p>En la serie Laravel, el paquete vive bajo <code>Demo\Microservices\Observability\</code> porque el prefijo de namespace es el que declara de quién es el código. El equivalente en Python es el <strong>namespace package de PEP 420</strong>: los directorios <code>demo/</code> y <code>demo/microservices/</code> <strong>no llevan <code>__init__.py</code></strong>; solo la hoja lo lleva:</p>
+
+<pre><code>src/
+└── demo/                       &lt;- namespace: SIN __init__.py
+    └── microservices/          &lt;- namespace: SIN __init__.py
+        └── observability/
+            └── __init__.py     &lt;- la hoja: CON __init__.py
+</code></pre>
+
+<p>La gracia de PEP 420: cuando llegue el segundo paquete (<code>demo/microservices/user_service_client</code>), los dos coexistirán bajo el mismo namespace <code>demo.microservices</code> sin conflicto — el <code>import</code> ya no dice dónde vive el código, dice de quién es.</p>
+
+<div>
+<p><strong>Detalle importante:</strong> si se pusiera un <code>__init__.py</code> en
+<code>demo/</code>, el primer paquete en resolverse "capturaría" el namespace y el segundo
+paquete volaría en tiempo de import. La regla es estricta: <strong>los niveles del
+namespace van siempre sin <code>__init__.py</code></strong>.</p>
+</div>
+
+<h2 id="app">6. El pyproject.toml de la aplicación</h2>
+
+<p>En <code>user-service/pyproject.toml</code> y <code>task-service/pyproject.toml</code> se han añadido dos cosas.</p>
+
+<h3>6.1 El bloque sources</h3>
+
+<pre><code>[tool.uv.sources]
+microservices-observability = { path = "../packages/microservices-observability", editable = true }
+</code></pre>
+
+<p>El <code>path</code> es <strong>relativo al directorio del servicio</strong>. Por eso es <code>../packages/...</code> y no una ruta absoluta: el proyecto se puede clonar en cualquier sitio y sigue funcionando.</p>
+
+<h3>6.2 El bloque dependencies</h3>
+
+<pre><code>dependencies = [
+    "fastapi>=0.115",
+    ...
+    "microservices-observability",
+]
+</code></pre>
+
+<p>Se registró con el comando real:</p>
+
+<pre><code>$ cd user-service &amp;&amp; uv add --editable ../packages/microservices-observability
+   Building microservices-observability @ file:///…/packages/microservices-observability
+      Built microservices-observability @ file:///…/packages/microservices-observability
+ + microservices-observability==0.1.0 (from file:///…/packages/microservices-observability)
+</code></pre>
+
+<h3>6.3 Las dos mitades juntas</h3>
+
+<div>
+<p><strong>Una de las dos piezas no basta:</strong></p>
+<ul>
+<li>El <code>[tool.uv.sources]</code> le dice a uv <em>dónde</em> está el paquete y que lo enlace en modo editable.</li>
+<li>El <code>dependencies</code> le dice <em>que lo quieres</em>.</li>
+</ul>
+<p>Con las dos, uv lo resuelve (y lo deja apuntado en <code>uv.lock</code>). Con solo una, o no lo encuentra o no lo instala.</p>
+</div>
+
+<h2 id="editable">7. Por qué editable y no una copia</h2>
+
+<p>Esta es la parte que conviene entender, porque cambia cómo se trabaja. Después del <code>uv add</code>, el paquete <strong>no está copiado en el venv</strong>: apunta al árbol fuente:</p>
+
+<pre><code>$ cd task-service &amp;&amp; uv run python -c "import demo.microservices.observability as m; print(m.__file__)"
+/Users/…/demo-microservicios/packages/microservices-observability/src/demo/microservices/observability/__init__.py
+</code></pre>
+
+<p>El <code>__file__</code> del módulo vive en <code>packages/</code>, no en <code>.venv/</code>. Es el equivalente al symlink de <code>vendor/demo/microservices-observability</code> de la serie Laravel.</p>
+
+<h3>Lo que eso permite</h3>
+
+<pre><code>$ vim packages/microservices-observability/src/demo/microservices/observability/__init__.py
+# guardar, y listo: los dos servicios ya usan el cambio</code></pre>
+
+<p>Sin ejecutar <code>uv add</code> otra vez. Sin reinstalar nada. Sin riesgo de tener una versión del paquete en el venv y otra en <code>packages/</code>.</p>
+
+<h3>Lo que hay que vigilar</h3>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Riesgo</th><th>Qué pasa</th><th>Cómo se evita</th></tr>
+<tr>
+<td>El enlace editable se pierde al recrear el venv</td>
+<td>Un <code>uv sync</code> lo recrea solo: la fuente está en <code>uv.lock</code> y el <code>pyproject.toml</code>, que sí se versionan</td>
+<td>Nada que hacer a mano</td>
+</tr>
+<tr>
+<td>Editar el paquete y no ver el cambio</td>
+<td>Solo puede pasar si se instaló sin <code>editable = true</code> (copia congelada)</td>
+<td>El bloque <code>sources</code> del consumidor manda; se corrige ahí</td>
+</tr>
+<tr>
+<td>Consumidor fuera del repo</td>
+<td>Un servicio que no viva junto a <code>packages/</code> no encuentra la ruta relativa</td>
+<td>En despliegue, se publica el paquete (PyPI privado) o se despliega el monorepo completo</td>
+</tr>
+</table>
+
+<h2 id="health">8. add_health: el HealthController del paquete</h2>
+
+<p>El <code>GET /health</code> estaba duplicado en los dos <code>main.py</code>, difiriendo solo en el nombre del servicio. Ahora el payload vive en un solo sitio, y cada aplicación decide en qué app lo monta y con qué nombre:</p>
+
+<pre><code>def add_health(app: Starlette, service: str) -> None:
+    def health(request: Request) -> JSONResponse:
+        return JSONResponse(
+            {
+                "status": "ok",
+                "service": service,
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+        )
+
+    app.add_route("/health", health, methods=["GET"])
+</code></pre>
+
+<div>
+<p><strong>El payload es estático a propósito.</strong> Un health check no debe depender de
+la base de datos, porque el caso interesante es justo el de la base de datos caída: si
+consultara la base de datos para saber si está bien, no podría distinguir "estoy vivo pero
+sin base de datos" de "estoy muerto", y el balanceador necesita esa diferencia.</p>
+</div>
+
+<p>Dos detalles del diseño: la respuesta se construye con <code>JSONResponse</code> a mano (no con la Response de FastAPI), y la firma acepta cualquier app de Starlette — es lo mismo que hizo el <code>HealthController</code> del paquete Laravel construyendo su <code>JsonResponse</code> sin helpers de Foundation. En la aplicación queda una línea:</p>
+
+<pre><code>add_health(app, "user-service")   # en el task-service: add_health(app, "task-service")
+</code></pre>
+
+<p>Y lo mismo con el resto de la API pública: la aplicación decide <em>qué</em> aplica y <em>dónde</em> — <code>app.add_middleware(RequestIdMiddleware)</code> y <code>configure_logging("user-service")</code> son decisiones del <code>main.py</code>, no del paquete. Un paquete que decide por ti en qué rutas se aplica es un paquete que impone comportamiento silencioso.</p>
+
+<h2 id="migracion">9. Migración paso a paso</h2>
+
+<p>Los siete pasos que se ejecutaron, por si hay que repetirlo con otro módulo:</p>
+
+<ol>
+<li><strong>Crear el esqueleto</strong> del paquete: <code>packages/microservices-observability/</code> con <code>pyproject.toml</code>, <code>README.md</code> y <code>src/demo/microservices/observability/</code>.</li>
+<li><strong>Copiar el código</strong> desde <code>app/observability.py</code> al <code>__init__.py</code> del paquete (copiar, no mover todavía) y actualizar el docstring: ya no es "una copia exacta", es <em>el</em> original.</li>
+<li><strong>Extraer el health</strong>: la función duplicada de los <code>main.py</code> se convirtió en <code>add_health(app, service)</code>.</li>
+<li><strong>Registrar el paquete</strong> en cada consumidor: <code>uv add --editable ../packages/microservices-observability</code> desde cada directorio de servicio.</li>
+<li><strong>Verificar el enlace</strong>: <code>uv run python -c "import demo.microservices.observability as m; print(m.__file__)"</code> en los dos servicios, y comprobar que apunta a <code>packages/</code>.</li>
+<li><strong>Actualizar los imports</strong> en los dos <code>main.py</code> y en <code>user_service_client.py</code>, <strong>borrar</strong> los dos <code>app/observability.py</code>.</li>
+<li><strong>Correr las suites</strong> de los dos servicios.</li>
+</ol>
+
+<div>
+<p><strong>Copiar antes de borrar.</strong> Es un cambio de tres archivos, pero un
+<code>rm</code> equivocado deja el proyecto sin middlewares y sin error de import: el error
+sale en tiempo de ejecución, en una petición. La verificación final con los tests es lo que
+convierte esto en un cambio seguro.</p>
+</div>
+
+<h2 id="errores">10. El error que apareció al migrar</h2>
+
+<p>Al mover el health al paquete, la suite del user-service cayó con esto:</p>
+
+<pre><code>TypeError: add_health.&lt;locals&gt;.health() takes 0 positional arguments but 1 was given
+</code></pre>
+
+<p>Con FastAPI, un endpoint definido con el decorador <code>@app.get("/health")</code> no necesita la <code>request</code>: FastAPI la inyecta solo si la pides. Pero al registrar la ruta con <code>app.add_route()</code> de Starlette, el endpoint es <em>función de Starlette</em>: <strong>siempre recibe la request</strong>. La firma correcta del paquete es <code>def health(request: Request)</code>, la pida o no.</p>
+
+<p>Exactamente el tipo de error que justifica el paquete: es una diferencia de contrato entre dos APIs que se parecen, y ahora está escrita <strong>una vez</strong>, test-eada en los dos consumidores.</p>
+
+<h2 id="lo-que-no-se-empaqueta">11. Lo que NO se empaquetó (y por qué)</h2>
+
+<p>Esta es la parte del trabajo que más conviene revisar, porque lo natural es empaquetar de más.</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Código</th><th>¿Paquete?</th><th>Razón</th></tr>
+<tr>
+<td><code>RequestIdMiddleware</code> + <code>ContextVar</code></td>
+<td><strong>Sí</strong></td>
+<td>Idéntico en ambos servicios, sin dependencias del servicio</td>
+</tr>
+<tr>
+<td><code>RequestIdFilter</code> / <code>Formatter</code> / <code>configure_logging</code></td>
+<td><strong>Sí</strong></td>
+<td>Idénticos en ambos servicios; la decisión de a qué loggers se cuelga el filtro la toma cada app</td>
+</tr>
+<tr>
+<td><code>add_health</code></td>
+<td><strong>Sí</strong></td>
+<td>Idéntico salvo el nombre del servicio. Si cada uno escribiera el suyo, acabarían respondiendo de forma distinta</td>
+</tr>
+<tr>
+<td><code>user_service_client.py</code></td>
+<td><strong>No todavía</strong></td>
+<td>Un solo consumidor hoy. La lógica del capítulo: "un paquete que solo usa un servicio no es un paquete". Cuando exista un tercer microservicio que valide tokens, será el segundo paquete — y con él el contrato <code>IdentityProvider</code></td>
+</tr>
+<tr>
+<td><code>db.py</code></td>
+<td><strong>No</strong></td>
+<td>Es idéntico, pero está casado con el <code>config.DATABASE_URL</code> y los modelos de cada servicio; moverlo rompería la regla de que cada servicio define su esquema</td>
+</tr>
+<tr>
+<td><code>rate_limit.py</code>, <code>auth.py</code>, <code>security.py</code></td>
+<td><strong>No</strong></td>
+<td>Específicos del servicio de identidad: solo el IdP recibe contraseñas y emite tokens</td>
+</tr>
+</table>
+
+<div>
+<p><strong>La trampa:</strong> <code>db.py</code> de los dos servicios es casi byte a byte
+idéntico, y pega la tentación de meterlo en el paquete "ya que estamos". Es exactamente lo
+que dice el principio de la estructura: un paquete que solo comparte "cosas parecidas" en
+lugar de "código que debe ser igual" crea acoplamiento sin evitar la divergencia que
+importa. <code>db.py</code> se queda.</p>
+</div>
+
+<h2 id="verificacion">12. Verificación</h2>
+
+<p>Tras la migración, en ambos servicios:</p>
+
+<pre><code>$ cd user-service &amp;&amp; uv run pytest -q
+.....................    [100%]        # 21 tests, OK
+
+$ cd task-service &amp;&amp; uv run pytest -q
+...............          [100%]        # 15/16: un rojo ajeno a esta extracción</code></pre>
+
+<p>El rojo del task-service (<code>test_header_malformado_es_401_sin_llamar_a_nadie</code>) viene de una migración a <code>HTTPBearer</code> de <code>deps.py</code> que estaba en marcha al mismo tiempo, no de la extracción del paquete: el resto de la suite — incluidos los 5 tests de observabilidad y los de la frontera — pasó sin tocar ni una aserción. Esa es la comprobación que importa: si la extracción hubiera cambiado un comportamiento, algún test habría caído.</p>
+
+<p>Y la cadena de observabilidad sigue intacta: el <code>request_id</code> se sigue generando, se sigue propagando al <code>user-service</code> y los logs siguen llevando el contexto — ahora desde <code>demo.microservices.observability</code>.</p>
+
+<h2 id="segundo-paquete">13. El segundo paquete: el cliente del user-service (todavía no)</h2>
+
+<p>En la serie Laravel, el cliente del user-service fue el segundo paquete. Aquí se queda en <code>task-service/app/user_service_client.py</code> por una razón concreta: <strong>solo lo consume un servicio</strong>. El user-service no lo necesita (es el IdP; no tiene a nadie a quien preguntar), y no hay tercer servicio.</p>
+
+<p>Lo que sí cambió: la frontera ahora consume el <code>ContextVar</code> del paquete:</p>
+
+<pre><code>from demo.microservices.observability import REQUEST_ID_HEADER, request_id
+</code></pre>
+
+<p>Y ese detalle apunta al orden de los pasos: el paquete de observabilidad (el código común) va primero porque el cliente futuro va a <strong>depender de él</strong> — propagar el <code>request_id</code> obliga a leer el mismo <code>ContextVar</code> que fija el middleware. Dos contextvars separados romperían la propagación en silencio. Cuando el tercer servicio aparezca, la extracción del cliente será el capítulo que cierre ese hueco.</p>
+
+<h2 id="comandos">14. Los comandos, de memoria</h2>
+
+<p>La secuencia completa para repetir esto, con el paquete ya creado (ver la sección siguiente para crearlo). Es corta: la instalación son <strong>un comando por servicio</strong>.</p>
+
+<pre><code># 1. Registrar el paquete en cada consumidor.
+#    SIEMPRE desde el directorio del servicio, una vez por servicio:
+$ cd user-service
+$ uv add --editable ../packages/microservices-observability
+   Building microservices-observability @ file:///…/packages/microservices-observability
+      Built microservices-observability @ file:///…/packages/microservices-observability
+ + microservices-observability==0.1.0 (from file:///…/packages/microservices-observability)
+
+$ cd ../task-service
+$ uv add --editable ../packages/microservices-observability
+ + microservices-observability==0.1.0 (from file:///…/packages/microservices-observability)
+
+# 2. Comprobar en cada servicio que el enlace es editable y no una copia:
+$ uv run python -c "import demo.microservices.observability as m; print(m.__file__)"
+…/demo-microservicios/packages/microservices-observability/src/demo/microservices/observability/__init__.py
+
+# 3. Las suites de los dos servicios:
+$ uv run pytest -q
+</code></pre>
+
+<p>Qué hace <code>uv add --editable</code> con un solo comando — son los mismos cuatro trabajos que en la serie Laravel repartían entre el <code>composer.json</code> y el <code>composer update</code>:</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Trabajo</th><th>Dónde queda</th></tr>
+<tr>
+<td>Escribe la dependencia</td>
+<td><code>dependencies = [... "microservices-observability"]</code> en el <code>pyproject.toml</code> del servicio</td>
+</tr>
+<tr>
+<td>Declara la fuente local</td>
+<td><code>[tool.uv.sources]</code> con <code>path = "../packages/…"</code> y <code>editable = true</code></td>
+</tr>
+<tr>
+<td>Congela la resolución</td>
+<td><code>uv.lock</code> del servicio</td>
+</tr>
+<tr>
+<td>Enlaza el paquete</td>
+<td>Dentro del <code>.venv</code> del servicio, en modo editable: el módulo apunta al árbol fuente de <code>packages/</code>, no hay copia</td>
+</tr>
+</table>
+
+<div>
+<p><strong>Y si el venv se recrea</strong> (o se clona el repo en otra máquina): <code>uv sync</code>
+reconstruye el enlace solo, leyendo el <code>pyproject.toml</code> y el <code>uv.lock</code> —
+que son los que se versionan. No hay que repetir <code>uv add</code>.</p>
+</div>
+
+<p>Lo que <strong>no</strong> hay que hacer:</p>
+
+<ul>
+<li><code>uv pip install -e ../packages/…</code>: instala el enlace pero <strong>no lo escribe ni en el <code>pyproject.toml</code> ni en el <code>uv.lock</code></strong> — el siguiente <code>uv sync</code> lo borra sin aviso. Es la trampa clásica de quien viene de pip.</li>
+<li>Correr <code>uv add</code> desde la raíz del repo: la dependencia quedaría registrada en el proyecto de la raíz, no en el servicio. Dir primero, comando después.</li>
+<li>Olvidar el <code>--editable</code>: uv copiaría el paquete congelado al venv y las ediciones en <code>packages/</code> no se verían hasta reinstalar.</li>
+</ul>
+
+<h2 id="manual">15. Crear el paquete a mano (referencia)</h2>
+
+<p>Referencia para repetirlo sin ayuda de nadie. Hay dos caminos; los dos acaban en la misma estructura.</p>
+
+<h3>Camino A: el generador de uv, y luego ajustar</h3>
+
+<pre><code>$ mkdir -p packages
+$ cd packages
+$ uv init --package --lib microservices-observability
+</code></pre>
+
+<p>Eso andamia un paquete con hatchling y layout <code>src/</code>. Quedan tres ajustes para dejarlo como el de la serie:</p>
+
+<ol>
+<li><strong>Mover el código al namespace.</strong> El generador crea <code>src/microservices_observability/</code>; se renombra a <code>src/demo/microservices/observability/</code> (los niveles del namespace sin <code>__init__.py</code>, la hoja con él) y en el <code>pyproject.toml</code> se añade <code>[tool.hatch.build.targets.wheel] packages = ["src/demo"]</code>.</li>
+<li><strong>Recortar las dependencias.</strong> El generador no declara ninguna por defecto, que es lo correcto: solo se añade lo que el código importa — <code>starlette</code> y no <code>fastapi</code>.</li>
+<li><strong>README y <code>description</code></strong> con lo que el paquete promete.</li>
+</ol>
+
+<h3>Camino B: cien por ciento a mano</h3>
+
+<pre><code>$ mkdir -p packages/microservices-observability/src/demo/microservices/observability
+$ touch packages/microservices-observability/src/demo/microservices/observability/__init__.py
+</code></pre>
+
+<p>Y un <code>pyproject.toml</code>. Esto es <strong>todo</strong> lo que hace falta para que uv pueda instalarlo:</p>
+
+<pre><code>[project]
+name = "microservices-observability"
+version = "0.1.0"
+description = "Correlation ID, health check y logs con contexto para microservicios FastAPI"
+requires-python = ">=3.13"
+dependencies = ["starlette>=0.40"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/demo"]
+</code></pre>
+
+<h3>La lista de comprobación</h3>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Regla</th><th>Por qué</th></tr>
+<tr>
+<td><code>name</code> en kebab-case</td>
+<td>Es el nombre de <em>instalación</em> (lo que se declara en <code>uv add</code>). El <em>import</em> es otra cosa: sale de los directorios (<code>demo.microservices.observability</code>). Conviene separarlas de cabeza desde el primer día.</td>
+</tr>
+<tr>
+<td>Layout <code>src/</code></td>
+<td>El código del paquete no se mezcla con su <code>pyproject.toml</code> ni con los tests que pueda tener después; y evita el error clásico de importar el paquete "porque estás parado en su carpeta"</td>
+</tr>
+<tr>
+<td>Niveles del namespace sin <code>__init__.py</code></td>
+<td>PEP 420: si un nivel del namespace lo lleva, captura el árbol y cualquier otro paquete bajo el mismo namespace volará en el import. Solo la hoja lleva <code>__init__.py</code></td>
+</tr>
+<tr>
+<td><code>packages = ["src/demo"]</code> apuntando al raíz del namespace</td>
+<td>Es lo que le dice a hatchling que empaquete el árbol tal cual, incluyendo los niveles sin <code>__init__.py</code></td>
+</tr>
+<tr>
+<td>Dependencias mínimas</td>
+<td>Solo lo que el código importa de verdad. Declarar <code>fastapi</code> "por si acaso" obligaría a cualquier consumidor a instalar el framework completo</td>
+</tr>
+<tr>
+<td>Extras opcionales: <code>py.typed</code>, LICENSE</td>
+<td><code>py.typed</code> dentro del paquete hace que los consumidores vean los type hints; la licencia importará si el paquete sale del repo algún día</td>
+</tr>
+</table>
+
+<div>
+<p><strong>La regla que decide si algo es paquete:</strong> se empaqueta lo que debe ser
+<em>idéntico</em> en varios servicios; se queda en <code>app/</code> lo que solo es
+<em>parecido</em>. Y el paquete no toma decisiones por la aplicación: publica piezas
+(middleware, health, logging) y cada <code>main.py</code> decide dónde se aplican.</p>
+</div>
+
+<h2 id="estado">16. Estado actual</h2>
+
+<p>Tras implementar lo anterior:</p>
+
+<ul>
+<li><strong>Tests:</strong> user-service <strong>21 tests</strong> — OK. task-service <strong>15/16</strong> — el rojo es de una migración a <code>HTTPBearer</code> en curso en <code>deps.py</code>, ajena a este capítulo.</li>
+<li><strong>Estructura:</strong> el código común vive en <code>packages/microservices-observability</code>; los dos <code>app/observability.py</code> dejaron de existir.</li>
+<li><strong>Consumo:</strong> dependencia editable por ruta en los dos servicios; los cambios en el paquete se ven al instante, sin reinstalar.</li>
+<li><strong>Convención actualizada:</strong> "cada servicio es un proyecto uv independiente" sigue siendo verdad, pero ya no significa "cero código compartido": significa "dependencias locales declaradas por ruta".</li>
+<li><strong>Pendiente:</strong> cerrar la migración a <code>HTTPBearer</code> en <code>deps.py</code> (que dejó un <code>print(token)</code> en la ruta — nunca loguear el token crudo), y el segundo paquete cuando aparezca el tercer servicio.</li>
+</ul>
+
+<hr>
+
+<footer>
+<p><em>Nota:</em> el paquete vive en <code>packages/microservices-observability/</code>, se declara en el <code>pyproject.toml</code> de cada servicio (bloques <code>dependencies</code> y <code>[tool.uv.sources]</code>, registrados con <code>uv add --editable</code> desde cada directorio de servicio), y la única pieza que toca el <code>main.py</code> de cada app son tres líneas: <code>configure_logging()</code>, <code>add_middleware</code> y <code>add_health</code>. Los niveles <code>demo/</code> y <code>demo/microservices/</code> del namespace van siempre sin <code>__init__.py</code>.</p>
+</footer>
+
+</article>
+
+</body>
+</html>

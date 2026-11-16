@@ -1,10 +1,13 @@
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
 
 from fastapi import FastAPI
 
+from demo.microservices.observability import (
+    RequestIdMiddleware,
+    add_health,
+    configure_logging,
+)
 from app.db import Base, engine
-from app.observability import RequestIdMiddleware, configure_logging
 from app.routes_tasks import router as tasks_router
 
 # INFO visible y request_id en cada línea: aquí nacen los warnings de la
@@ -27,15 +30,4 @@ app = FastAPI(
 )
 app.add_middleware(RequestIdMiddleware)
 app.include_router(tasks_router)
-
-
-@app.get("/health")
-def health() -> dict[str, str]:
-    """Comprobación de vida sin autenticar y sin tocar la base de datos:
-    el caso interesante es justo la BD caída, y si el health consultara la
-    BD no podría distinguir "vivo pero sin BD" de "muerto"."""
-    return {
-        "status": "ok",
-        "service": "task-service",
-        "timestamp": datetime.now(UTC).isoformat(),
-    }
+add_health(app, "task-service")

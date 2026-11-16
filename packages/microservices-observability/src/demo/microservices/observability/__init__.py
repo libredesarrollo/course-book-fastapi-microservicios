@@ -1,19 +1,29 @@
-"""Correlation ID y logs con contexto (capítulo 4).
+"""Correlation ID, health check y logs con contexto (capítulo 5).
 
-task-service lleva una copia exacta de este módulo: los dos servicios son
-proyectos uv independientes y no comparten código. El contrato es el mismo
-que fija la serie: `X-Request-Id` se respeta si llega del cliente (o del
-servicio que nos llama) y se genera si no; siempre sale en la respuesta; y
-queda al alcance de cualquier log de la petición sin pasarlo a mano.
+Paquete interno de la serie, consumido por user-service y task-service como
+dependencia editable por ruta: el equivalente Python de los repositorios
+`path` de Composer. Es el único sitio donde existe este código; si cambia
+aquí, cambian los dos servicios a la vez.
+
+El contrato es el mismo que fija la serie: `X-Request-Id` se respeta si
+llega del cliente (o del servicio que nos llama) y se genera si no; siempre
+sale en la respuesta; y queda al alcance de cualquier log de la petición
+sin pasarlo a mano.
+
+El paquete declara `starlette` y no `fastapi`: solo necesita el middleware
+y las respuestas HTTP, y así no obliga a instalar el framework completo.
 """
 
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
+from datetime import UTC, datetime
 
-from fastapi import Request, Response
+from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 REQUEST_ID_HEADER = "X-Request-Id"
 
@@ -25,8 +35,8 @@ request_id: ContextVar[str | None] = ContextVar("request_id", default=None)
 
 class RequestIdMiddleware(BaseHTTPMiddleware):
     async def dispatch(
-        self, request: Request, call_next: Callable[[Request], Awaitable[Response]]
-    ) -> Response:
+        self, request: Request, call_next: Callable[[Request], Awaitable[JSONResponse]]
+    ) -> JSONResponse:
         rid = request.headers.get(REQUEST_ID_HEADER) or str(uuid.uuid4())
         token = request_id.set(rid)
         try:
@@ -61,7 +71,12 @@ class RequestIdFormatter(logging.Formatter):
 
 
 def configure_logging(*loggers: str) -> None:
-    """INFO visible y request_id en cada línea del handler de raíz."""
+    """INFO visible y request_id en cada línea del handler de raíz.
+
+    Cada servicio pasa los nombres de los loggers de negocio que quieren el
+    contexto: el paquete no toca el logging de la aplicación, igual que en
+    la serie Laravel el provider no aplicaba los middlewares por su cuenta.
+    """
     logging.basicConfig(level=logging.INFO)
     formatter = RequestIdFormatter(
         "%(levelname)s:%(name)s:%(message)s request_id=%(request_id)s"
@@ -70,3 +85,22 @@ def configure_logging(*loggers: str) -> None:
         handler.setFormatter(formatter)
     for name in loggers:
         logging.getLogger(name).addFilter(RequestIdFilter())
+
+
+def add_health(app: Starlette, service: str) -> None:
+    """Publica GET /health: comprobación de vida sin autenticar y sin tocar
+    la base de datos. El payload es estático a propósito: si consultara la
+    BD, no podría distinguir "vivo pero sin BD" de "muerto", y el
+    balanceador necesita esa diferencia. La respuesta se construye a mano
+    para no depender de nada del framework por encima de Starlette."""
+
+    def health(request: Request) -> JSONResponse:
+        return JSONResponse(
+            {
+                "status": "ok",
+                "service": service,
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+        )
+
+    app.add_route("/health", health, methods=["GET"])

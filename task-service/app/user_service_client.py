@@ -6,7 +6,7 @@ from fastapi import HTTPException
 import httpx2
 
 from app import config
-from app.observability import REQUEST_ID_HEADER, request_id
+from demo.microservices.observability import REQUEST_ID_HEADER, request_id
 
 log = logging.getLogger("task-service")
 

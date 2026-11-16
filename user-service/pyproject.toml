@@ -8,6 +8,7 @@ dependencies = [
     "uvicorn[standard]>=0.30",
     "sqlalchemy>=2.0",
     "email-validator>=2.0",
+    "microservices-observability",
 ]
 
 [dependency-groups]
@@ -16,3 +17,6 @@ dev = ["pytest>=8.0", "httpx2>=0.1"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+
+[tool.uv.sources]
+microservices-observability = { path = "../packages/microservices-observability", editable = true }
