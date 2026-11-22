@@ -218,6 +218,23 @@ dependencies = [
 requires-dist = [{ name = "starlette", specifier = ">=0.40" }]
 
 [[package]]
+name = "microservices-user-service-client"
+version = "0.1.0"
+source = { editable = "../packages/microservices-user-service-client" }
+dependencies = [
+    { name = "fastapi" },
+    { name = "httpx2" },
+    { name = "microservices-observability" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "fastapi", specifier = ">=0.115" },
+    { name = "httpx2", specifier = ">=0.1" },
+    { name = "microservices-observability", editable = "../packages/microservices-observability" },
+]
+
+[[package]]
 name = "opentelemetry-api"
 version = "1.45.2"
 source = { registry = "https://pypi.org/simple" }
@@ -504,6 +521,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "httpx2" },
     { name = "microservices-observability" },
+    { name = "microservices-user-service-client" },
     { name = "sqlalchemy" },
     { name = "uvicorn", extra = ["standard"] },
 ]
@@ -518,6 +536,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.115" },
     { name = "httpx2", specifier = ">=0.1" },
     { name = "microservices-observability", editable = "../packages/microservices-observability" },
+    { name = "microservices-user-service-client", editable = "../packages/microservices-user-service-client" },
     { name = "sqlalchemy", specifier = ">=2.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
 ]

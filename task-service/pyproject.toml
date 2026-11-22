@@ -9,6 +9,7 @@ dependencies = [
     "sqlalchemy>=2.0",
     "httpx2>=0.1",
     "microservices-observability",
+    "microservices-user-service-client",
 ]
 
 [dependency-groups]
@@ -20,3 +21,4 @@ addopts = "-q"
 
 [tool.uv.sources]
 microservices-observability = { path = "../packages/microservices-observability", editable = true }
+microservices-user-service-client = { path = "../packages/microservices-user-service-client", editable = true }

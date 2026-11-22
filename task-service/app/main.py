@@ -7,13 +7,14 @@ from demo.microservices.observability import (
     add_health,
     configure_logging,
 )
+from demo.microservices.user_service_client import LOGGER_NAME
 from app.db import Base, engine
 from app.routes_tasks import router as tasks_router
 
 # INFO visible y request_id en cada línea: aquí nacen los warnings de la
-# frontera (app/user_service_client.py) y deben salir con su traza
-# (capítulo 4).
-configure_logging("task-service")
+# frontera (paquete microservices-user-service-client) y deben salir con
+# su traza (capítulo 4).
+configure_logging("task-service", LOGGER_NAME)
 
 
 @asynccontextmanager

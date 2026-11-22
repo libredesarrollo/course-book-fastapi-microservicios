@@ -41,7 +41,7 @@ def test_propaga_al_user_service_el_request_id_del_cliente(monkeypatch):
         # 401 basta: la cabecera ya salió, y así el test no toca la BD.
         return StubResponse(401)
 
-    monkeypatch.setattr("app.user_service_client._http_get", espia)
+    monkeypatch.setattr("demo.microservices.user_service_client._http_get", espia)
 
     with TestClient(app) as c:
         c.get("/api/tasks", headers={"X-Request-Id": "traza-e2e-001", "Authorization": "Bearer t"})
@@ -56,7 +56,7 @@ def test_propaga_al_user_service_el_request_id_generado(monkeypatch):
         captured["headers"] = headers
         return StubResponse(401)
 
-    monkeypatch.setattr("app.user_service_client._http_get", espia)
+    monkeypatch.setattr("demo.microservices.user_service_client._http_get", espia)
 
     with TestClient(app) as c:
         c.get("/api/tasks", headers={"Authorization": "Bearer t"})
@@ -69,9 +69,9 @@ def test_el_request_id_llega_a_los_logs_de_la_frontera(caplog, monkeypatch):
     def caido(url, headers):
         raise httpx2.ConnectError("connection refused")
 
-    monkeypatch.setattr("app.user_service_client._http_get", caido)
+    monkeypatch.setattr("demo.microservices.user_service_client._http_get", caido)
 
-    with caplog.at_level(logging.INFO, logger="task-service"):
+    with caplog.at_level(logging.INFO, logger="user-service-client"):
         with TestClient(app) as c:
             c.get(
                 "/api/tasks",

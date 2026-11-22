@@ -2,7 +2,7 @@ from typing import Any
 
 from fastapi import Header, HTTPException
 
-from app.user_service_client import verify_token
+from demo.microservices.user_service_client import verify_token
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
