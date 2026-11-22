@@ -23,6 +23,9 @@ cd user-service && uv run uvicorn app.main:app --port 8000
 
 # Terminal 2 — tareas
 cd task-service && uv run uvicorn app.main:app --port 8001
+
+# Terminal 3 — bills
+cd billing-service && uv run uvicorn app.main:app --port 8002
 ```
 
 Seed: `cd user-service && uv run python -m app.seed`

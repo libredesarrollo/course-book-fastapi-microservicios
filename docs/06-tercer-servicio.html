@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>El tercer microservicio: billing-service y el segundo paquete</title>
+</head>
+<body>
+
+<article>
+
+<header>
+<h1>El tercer microservicio: billing-service y el segundo paquete</h1>
+
+<p><strong>Resumen:</strong> con dos servicios, el código común se duplica y se aguanta. Con el
+<strong>tercer</strong>, deja de aguantarse: cuando <code>billing-service</code> necesita validar tokens,
+<code>user_service_client.py</code> pasa a existir en dos sitios y la divergencia solo es cuestión de
+tiempo. Este capítulo crea el tercer servicio, documenta cómo nació el problema — con la copia
+duplicada en verde — y lo cierra extrayendo el <strong>segundo paquete</strong>:
+<code>microservices-user-service-client</code>, que además es el primero que <em>depende de otro
+paquete interno</em>.</p>
+
+<p>Referencia de la serie Laravel: <code>laravel/billing-service/</code> y el paquete
+<code>microservices-user-service-client</code>.</p>
+</header>
+
+<nav>
+<h2>Contenido</h2>
+<ol>
+<li><a href="#tercero">El tercer servicio: por qué billing</a></li>
+<li><a href="#dominio">El dominio: facturas, no tareas</a></li>
+<li><a href="#nacimiento">El nacimiento del problema: dos copias</a></li>
+<li><a href="#paquete">El segundo paquete</a></li>
+<li><a href="#pyproject">Su pyproject.toml: dependencia de paquete a paquete</a></li>
+<li><a href="#config">La configuración por entorno</a></li>
+<li><a href="#logger">El logger de la frontera: de quién es el warning</a></li>
+<li><a href="#migracion">Migración paso a paso</a></li>
+<li><a href="#tests">Lo que cambió en los tests</a></li>
+<li><a href="#contratos">Los contratos que no cambian</a></li>
+<li><a href="#verificacion">Verificación</a></li>
+<li><a href="#e2e">E2E en vivo: la traza cruzando tres servicios</a></li>
+<li><a href="#pendiente">Lo que billing todavía NO tiene</a></li>
+<li><a href="#estado">Estado actual</a></li>
+</ol>
+</nav>
+
+<hr>
+
+<h2 id="tercero">1. El tercer servicio: por qué billing</h2>
+
+<p>La serie ya tiene dos servicios: <code>user-service</code> (el IdP) y <code>task-service</code>
+(las tareas). El tercero es <code>billing-service</code>: las facturas. En la serie Laravel es el
+receptor del evento <code>task.completed</code>; en este punto del camino FastAPI es un CRUD
+autenticado vía el IdP, igual que task-service — la maquinaria de eventos llega después
+(ver la <a href="#pendiente">sección 13</a>).</p>
+
+<pre><code>demo-microservicios/
+├── user-service/      :8000  IdP (no cambia en este capítulo)
+├── task-service/      :8001  tareas; ahora consume el paquete 2
+├── billing-service/   :8002  facturas; el servicio nuevo
+├── packages/
+│   ├── microservices-observability/        (paquete 1, capítulo 5)
+│   └── microservices-user-service-client/  (paquete 2, este capítulo)
+└── docs/</code></pre>
+
+<p>La regla del repo se mantiene: cada servicio es un proyecto <code>uv</code> independiente,
+con su <code>pyproject.toml</code>, su <code>uv.lock</code> y su <code>.venv</code>. No hay workspace.
+Lo que comparten son dependencias declaradas por ruta.</p>
+
+<h2 id="dominio">2. El dominio: facturas, no tareas</h2>
+
+<p><code>billing-service</code> es "task-service pero facturando": la misma estructura de archivos
+(<code>config.py</code>, <code>db.py</code>, <code>models.py</code>, <code>schemas.py</code>,
+<code>deps.py</code>, <code>routes_*.py</code>, <code>main.py</code>) con el dominio del
+<code>Invoice</code> de Laravel, sin la maquinaria de eventos:</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Campo</th><th>Tipo</th><th>Notas</th></tr>
+<tr><td><code>user_id</code></td><td>int, indexado</td><td>Lo pone el sistema desde la identidad validada; el payload no puede inyectarlo</td></tr>
+<tr><td><code>task_id</code></td><td>int, nullable</td><td>De qué tarea nace la factura; <code>None</code> si se creó a mano</td></tr>
+<tr><td><code>task_title</code></td><td>text</td><td>Título de la tarea facturada (1–200 en el schema)</td></tr>
+<tr><td><code>amount</code></td><td>float</td><td><code>gt=0</code> en pydantic: un monto negativo es 422</td></tr>
+<tr><td><code>status</code></td><td>string(20)</td><td><code>pending</code> / <code>paid</code>; valor raro → <strong>422</strong> (misma regla que tasks)</td></tr>
+<tr><td><code>created_at</code> / <code>updated_at</code></td><td>datetime</td><td>Naive en UTC (sqlite no conserva tzinfo)</td></tr>
+</table>
+
+<p>Endpoints, todos autenticados vía el IdP:</p>
+
+<pre><code>POST   /api/bills          201
+GET    /api/bills          lista las propias (desc por id)
+GET    /api/bills/{id}     200 propia · 403 ajena · 404 inexistente
+PUT    /api/bills/{id}     200 · 403 ajena · 422 status inválido
+DELETE /api/bills/{id}     204 · después 404</code></pre>
+
+<p>Y el health del paquete 1: <code>GET /health</code> responde
+<code>{"status":"ok","service":"billing-service",...}</code> sin tocar la BD.</p>
+
+<h2 id="nacimiento">3. El nacimiento del problema: dos copias</h2>
+
+<p>Esta es la parte que conviene contar tal cual pasó, porque el paquete 2 solo se entiende
+después de ver el problema. Para crear <code>billing-service</code> se copió el esqueleto de
+<code>task-service</code> — y entre lo copiado venía <code>app/user_service_client.py</code>,
+la frontera de red con el IdP del capítulo 2:</p>
+
+<pre><code>task-service/app/user_service_client.py     (~73 líneas)
+billing-service/app/user_service_client.py  (~73 líneas)   &lt;- copia, byte a byte</code></pre>
+
+<p>Con esa copia, billing-service pasó su suite completa: <strong>17/17 en verde</strong>. Y ese es
+justo el punto: la duplicación <strong>no rompe nada</strong>. Los tests pasan, el E2E funciona, y
+mientras tanto la primera divergencia ya existía — la copia de billing loggeaba sus warnings
+con el logger <code>"billing-service"</code> y la de task con <code>"task-service"</code>. Divergir
+es lo que hacen dos copias; solo es cuestión de cuándo y de cuánto cuesta darse cuenta.</p>
+
+<div>
+<p><strong>La lección del tercer servicio:</strong> con dos servicios, el código duplicado es
+"incomodidad". Con tres, es un <em>riesgo operativo con nombre</em>: la política de errores de la
+frontera (401 vs 503 vs 502), la propagación del <code>request_id</code> y el formato de los
+warnings viven en N sitios y van a divergir. Cuando un servicio se copia de otro y copia la
+frontera, ese es el momento de extraer el paquete — no antes, no después.</p>
+</div>
+
+<h2 id="paquete">4. El segundo paquete</h2>
+
+<p>Mismo esqueleto que el paquete 1 (hatchling, layout <code>src/</code>, namespace PEP 420
+compartido — los niveles <code>demo/</code> y <code>demo/microservices/</code> van
+<strong>sin <code>__init__.py</code></strong> en los dos paquetes; solo las hojas lo llevan):</p>
+
+<pre><code>packages/microservices-user-service-client/
+├── pyproject.toml
+├── README.md
+└── src/demo/microservices/user_service_client/
+    └── __init__.py     &lt;- la frontera, en un solo sitio</code></pre>
+
+<p>El nombre de <em>instalación</em> es kebab-case (<code>microservices-user-service-client</code>);
+el de <em>import</em> sale de los directorios
+(<code>demo.microservices.user_service_client</code>). Es la separación de la cabeza que fija el
+capítulo 5.</p>
+
+<p>Lo que contiene el paquete:</p>
+
+<ul>
+<li><code>verify_token(token)</code>: pregunta al IdP (<code>GET /api/user</code> con el token
+opaco) y devuelve <code>{"id", "name", "email"}</code> o lanza <code>HTTPException</code> ya
+mapeada (ver la <a href="#contratos">sección 10</a>).</li>
+<li><code>_trace_headers()</code>: propaga el <code>request_id</code> leyendo el
+<strong>mismo <code>ContextVar</code> del paquete de observabilidad</strong>.</li>
+<li><code>LOGGER_NAME = "user-service-client"</code>: el nombre del logger de la frontera.</li>
+<li><code>USER_SERVICE_URL</code> / <code>HTTP_TIMEOUT_SECONDS</code>: configuración por entorno
+(ver la <a href="#config">sección 6</a>).</li>
+</ul>
+
+<h2 id="pyproject">5. Su pyproject.toml: dependencia de paquete a paquete</h2>
+
+<p>Entero, porque tiene una novedad respecto al paquete 1:</p>
+
+<pre><code>[project]
+name = "microservices-user-service-client"
+version = "0.1.0"
+description = "Frontera de red con el IdP: verificación de tokens opacos con traza y errores mapeados (capítulo 6)"
+requires-python = "&gt;=3.13"
+dependencies = [
+    "fastapi&gt;=0.115",
+    "httpx2&gt;=0.1",
+    "microservices-observability",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/demo"]
+
+[tool.uv.sources]
+microservices-observability = { path = "../microservices-observability", editable = true }
+</code></pre>
+
+<p>Tres decisiones, en orden de importancia:</p>
+
+<ol>
+<li><strong>Declara <code>fastapi</code> sí.</strong> A diferencia del paquete de observabilidad
+(solo <code>starlette</code>), este paquete lanza <code>HTTPException</code> de FastAPI — el
+contrato de errores de la serie. Es el paralelo exacto del paquete Laravel, que declara
+<code>illuminate/http</code> y <code>illuminate/support</code>: el cliente <em>habla el idioma del
+framework</em> porque su contrato son excepciones que el framework convierte en respuestas.</li>
+<li><strong>Depende del paquete 1</strong> (<code>microservices-observability</code>): propagar el
+<code>request_id</code> obliga a leer el mismo <code>ContextVar</code> que fija el middleware.
+Dos contextvars separados romperían la traza en silencio — el detalle que anticipó el capítulo 5
+y que aquí se materializa.</li>
+<li><strong>Su propio bloque <code>[tool.uv.sources]</code></strong> para resolver esa dependencia
+interna: la ruta es relativa al <em>directorio del paquete</em> (<code>../microservices-observability</code>).
+Cuando un servicio instala este paquete editable, uv lee su <code>pyproject.toml</code> en su
+propio directorio y la ruta relativa cuadra.</li>
+</ol>
+
+<p>La verificación de que la cadena completa resuelve al árbol fuente, desde un consumidor:</p>
+
+<pre><code>$ cd billing-service &amp;&amp; uv run python -c "
+import demo.microservices.user_service_client as c
+import demo.microservices.observability as o
+print(c.__file__); print(o.__file__)"
+…/packages/microservices-user-service-client/src/demo/microservices/user_service_client/__init__.py
+…/packages/microservices-observability/src/demo/microservices/observability/__init__.py
+</code></pre>
+
+<p>Los dos <code>__file__</code> apuntan a <code>packages/</code>: editable real en los dos eslabones
+— el equivalente de los symlinks encadenados de <code>vendor/</code> en la serie Laravel.</p>
+
+<h2 id="config">6. La configuración por entorno</h2>
+
+<p>La copia duplicada leía <code>config.USER_SERVICE_URL</code> de <code>app/config.py</code> de
+cada servicio. Un paquete no puede importar el <code>app.</code> de nadie — y no debería: la
+URL del IdP es un dato de <em>despliegue</em>, no de código. El paquete la lee del entorno
+(12-factor), con los mismos defaults que tenían los servicios:</p>
+
+<pre><code>USER_SERVICE_URL     = os.environ.get("USER_SERVICE_URL", "http://127.0.0.1:8000")
+HTTP_TIMEOUT_SECONDS = _env_int("HTTP_TIMEOUT_SECONDS", 2)
+</code></pre>
+
+<p>Y los <code>config.py</code> de los dos servicios quedaron con solo lo suyo
+(<code>DATABASE_URL</code>), con un comentario apuntando al paquete. La prueba de que funciona
+fue el E2E: billing arrancó con
+<code>USER_SERVICE_URL=http://127.0.0.1:8003</code> <strong>sin tocar ni una línea de código</strong>
+y la frontera preguntó al 8003 — se ve en su log:
+<code>{"base_url": "http://127.0.0.1:8003", "path": "/api/user"}</code>.</p>
+
+<h2 id="logger">7. El logger de la frontera: de quién es el warning</h2>
+
+<p>Este es el cambio de comportamiento más pequeño y el más fácil de pasar por alto. Las copias
+duplicadas loggeaban con el nombre de cada servicio
+(<code>logging.getLogger("task-service")</code>). Un paquete compartido no sabe en qué servicio
+corre, así que el warning ahora sale del logger del paquete:</p>
+
+<pre><code>LOGGER_NAME = "user-service-client"
+log = logging.getLogger(LOGGER_NAME)
+</code></pre>
+
+<p>Y cada servicio lo registra en <code>configure_logging()</code> junto al suyo, porque los
+filtros del <code>request_id</code> se cuelgan por nombre de logger (capítulo 4):</p>
+
+<pre><code>configure_logging("task-service", LOGGER_NAME)     # en billing: ("billing-service", LOGGER_NAME)
+</code></pre>
+
+<p>En el log, la línea cambia de dueño — y gana precisión, porque dice <em>quién</em> emitió:</p>
+
+<pre><code>ANTES:  WARNING:task-service:user-service unreachable {...} request_id=…
+AHORA:  WARNING:user-service-client:user-service unreachable {...} request_id=…
+</code></pre>
+
+<div>
+<p><strong>Por qué el paquete no cuelga el filtro él mismo:</strong> los filtros de logging se
+aplican al logger que <em>emite</em>, y los handlers los comparten. El paquete no puede saber qué
+loggers de la app llevan contexto; solo puede declarar cómo se llama el suyo. La decisión de
+dónde se cuelga el contexto sigue siendo de la aplicación — el mismo principio del capítulo 5:
+el paquete publica piezas, el <code>main.py</code> decide dónde se aplican.</p>
+</div>
+
+<h2 id="migracion">8. Migración paso a paso</h2>
+
+<p>Los pasos ejecutados, en el orden que hace segura la migración (el mismo esqueleto del
+capítulo 5: primero en verde, luego se cambia):</p>
+
+<ol>
+<li><strong>Crear billing-service</strong> como copia de task-service con el dominio de facturas,
+<span style="white-space:nowrap">incluida la copia de <code>user_service_client.py</code></span>.
+Su suite en verde (17/17): el problema existe, está documentado y funciona.</li>
+<li><strong>Crear el paquete</strong>: esqueleto + <code>pyproject.toml</code> + la frontera como
+<code>__init__.py</code>, con la configuración pasada a entorno y el logger renombrado.</li>
+<li><strong>Registrar el paquete en los dos consumidores</strong>: <code>uv add --editable
+../packages/microservices-user-service-client</code> desde cada directorio de servicio.</li>
+<li><strong>Verificar el enlace editable</strong> de los dos eslabones (paquete y su dependencia
+interna) con la prueba del <code>__file__</code>.</li>
+<li><strong>Conmutar los consumidores</strong>: <code>deps.py</code> de los dos servicios importa
+<code>verify_token</code> del paquete; los <code>main.py</code> pasan <code>LOGGER_NAME</code> a
+<code>configure_logging</code>.</li>
+<li><strong>Borrar las dos copias</strong> de <code>app/user_service_client.py</code> y limpiar los
+<code>config.py</code> (la URL del IdP y el timeout ya viven en el paquete).</li>
+<li><strong>Actualizar los tests</strong> (ver la <a href="#tests">sección 9</a>) y correr las tres
+suites.</li>
+</ol>
+
+<div>
+<p><strong>El orden importa:</strong> el paquete se registra y verifica <em>antes</em> de borrar
+las copias. Si el enlace editable no funcionara, el borrado dejaría los dos servicios sin
+frontera y el error saldría en una petición, no en un import. Con ese orden, el borrado es
+trámite.</p>
+</div>
+
+<h2 id="tests">9. Lo que cambió en los tests</h2>
+
+<p>Tres cambios, los tres mecánicos y los tres con su porqué:</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Antes (copia local)</th><th>Después (paquete)</th><th>Por qué</th></tr>
+<tr>
+<td><code>from app.user_service_client import verify_token</code></td>
+<td><code>from demo.microservices.user_service_client import verify_token</code></td>
+<td>El import dice de quién es el código, no dónde vive el archivo</td>
+</tr>
+<tr>
+<td><code>monkeypatch.setattr("app.user_service_client._http_get", …)</code></td>
+<td><code>monkeypatch.setattr("demo.microservices.user_service_client._http_get", …)</code></td>
+<td>El stub sigue siendo reemplazar la función HTTP <em>del paquete</em>; ningún test toca la red</td>
+</tr>
+<tr>
+<td><code>caplog.at_level(..., logger="task-service")</code></td>
+<td><code>caplog.at_level(..., logger="user-service-client")</code></td>
+<td>El warning lo emite ahora el logger del paquete (sección 7)</td>
+</tr>
+</table>
+
+<p>Lo que <strong>no</strong> cambió: ninguna aserción de negocio. El 401 del IdP sigue
+esperándose como identidad inválida, el 503 sigue diciendo cómo levantar el IdP, el 502 sigue
+siendo "respuesta inesperada", y el <code>request_id</code> sigue llegando a los warnings de la
+frontera. Si la extracción hubiera cambiado un comportamiento, habría caído aquí — no cayó.</p>
+
+<h2 id="contratos">10. Los contratos que no cambian</h2>
+
+<p><code>verify_token</code> mantiene punto por punto lo que la serie fijó en el capítulo 2:</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Situación</th><th>Respuesta</th><th>Por qué</th></tr>
+<tr>
+<td>IdP caído / timeout</td>
+<td><strong>503</strong> con el comando exacto para levantar el servicio</td>
+<td>Fallo de infraestructura, no de identidad: el cliente merece saber qué falta</td>
+</tr>
+<tr>
+<td>IdP responde 401</td>
+<td><strong>401</strong> local (<code>Token inválido o expirado</code>)</td>
+<td>Identidad inválida del token presentado, no un fallo nuestro</td>
+</tr>
+<tr>
+<td>IdP responde otra cosa</td>
+<td><strong>502</strong> (<code>Respuesta inesperada del user-service (HTTP …)</code>)</td>
+<td>El contrato cambió por debajo; no se disfraza</td>
+</tr>
+<tr>
+<td>Header malformado (no <code>Bearer &lt;token&gt;</code>)</td>
+<td><strong>401</strong> en <code>deps.py</code>, <strong>sin llamar a la red</strong></td>
+<td>El rechazo ocurre antes de la frontera; el espía de los tests lo confirma</td>
+</tr>
+<tr>
+<td>Llamada saliente</td>
+<td>Lleva <code>X-Request-Id</code> del <code>ContextVar</code></td>
+<td>La misma petición se sigue en los logs de los dos servicios</td>
+</tr>
+</table>
+
+<p>Y en <code>deps.py</code>, que sigue siendo pegamento de cada servicio (doce líneas): la
+distinción 403/404/422 de las rutas tampoco se movió — el paquete 2 es solo la frontera de red.</p>
+
+<h2 id="verificacion">11. Verificación</h2>
+
+<p>Las tres suites, tras la migración:</p>
+
+<pre><code>$ cd user-service    &amp;&amp; uv run pytest -q
+.....................            # 21/21  (sin tocar en este capítulo)
+
+$ cd task-service    &amp;&amp; uv run pytest -q
+...............                  # 15/16: el rojo es la migración HTTPBearer
+                                 # en deps.py, en curso y ajena a este capítulo
+
+$ cd billing-service &amp;&amp; uv run pytest -q
+.................                # 17/17 (7 CRUD + 5 frontera + 5 observabilidad)</code></pre>
+
+<p>El <code>task-service</code> rojo es el mismo test que ya estaba rojo antes de empezar
+(<code>test_header_malformado_es_401_sin_llamar_a_nadie</code>, espera el detalle del contrato
+viejo mientras <code>deps.py</code> migra a <code>HTTPBearer</code>). La extracción no movió
+ninguna aserción de negocio: si algo hubiera cambiado de comportamiento, algún test de los
+verdes habría caído.</p>
+
+<h2 id="e2e">12. E2E en vivo: la traza cruzando tres servicios</h2>
+
+<p>Con los tres servicios en pie (user-service en :8003 para no estorbar el proceso ya en
+marcha del :8000, y billing apuntándole por entorno), el flujo completo:</p>
+
+<pre><code>$ curl -s -X POST http://127.0.0.1:8002/api/bills \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "X-Request-Id: traza-e2e-cap6" \
+    -H "Content-Type: application/json" \
+    -d '{"task_title":"Escribir el informe","amount":10.5,"task_id":3}'
+
+{"id":1,"user_id":1,"task_id":3,"task_title":"Escribir el informe",
+ "amount":10.5,"status":"pending", …}                    # 201, dueño del sistema</code></pre>
+
+<p>Y lo que dejó la frontera en los logs — el momento en que este capítulo cobra sentido:</p>
+
+<pre><code># en billing-service: la llamada saliente ya no es anónima
+WARNING:user-service-client:user-service unreachable {"base_url": "http://127.0.0.1:8003", "path": "/api/user"} request_id=idp-caido-001
+
+# en user-service: la misma traza, cruzando servicios
+INFO:user-service:API token issued {"user_id": 1, "name": "Ana Torres"} request_id=traza-e2e-cap6
+</code></pre>
+
+<p>El primer warning es el del IdP caído (se paró el :8003 a propósito): <strong>503 con el
+comando para levantarlo</strong>, y el <code>request_id</code> diciendo qué cliente lo provocó.
+El segundo es el <code>request_id</code> que billing recibió del cliente y el paquete propagó al
+IdP en su <code>GET /api/user</code> — la misma petición, seguida en dos servicios, con el
+ContextVar compartido por los dos paquetes.</p>
+
+<h2 id="pendiente">13. Lo que billing todavía NO tiene</h2>
+
+<p>La serie Laravel, en este mismo servicio, ya trae la maquinaria de eventos
+(<code>b0.9</code>): el outbox de task-service, el webhook firmado con HMAC
+(<code>POST /api/events</code> + <code>events.verify</code>), la cola <code>invoices</code>, el
+job <code>CreateInvoiceFromEvent</code> con idempotencia por <code>UNIQUE event_id</code>, y el
+anti-replay por <code>Cache::add</code>. Eso aquí todavía no existe — y no es un olvido:</p>
+
+<ul>
+<li>Las facturas se crean hoy por API directa; en Laravel nacen del evento
+<code>task.completed</code> que emite task-service.</li>
+<li>El modelo Laravel tiene <code>event_id UNIQUE</code> justo para la idempotencia del receptor
+at-least-once; ese campo no tiene sentido sin el evento.</li>
+<li>Cuando llegue ese capítulo, la factura dejará de crearse por API y el receptor responderá
+<code>202</code> al webhook conocido y <code>204</code> al desconocido, con el secret emparejado
+(<code>TASK_EVENTS_SECRET</code> / <code>BILLING_EVENTS_SECRET</code>).</li>
+</ul>
+
+<div>
+<p><strong>Nota del paquete 2 en Laravel:</strong> allá el paquete ya trae reintentos idempotentes
+y circuit breaker, y versiones JWT/SSO de capítulos posteriores (<code>b0.7</code>). Aquí el
+paquete 2 es la frontera tal cual era: verificación de token opaco con traza. Los reintentos y
+el breaker son un capítulo propio — y ahora tienen un solo sitio donde vivir, que es la ventaja
+que este capítulo compró.</p>
+</div>
+
+<h2 id="estado">14. Estado actual</h2>
+
+<p>Tras implementar lo anterior:</p>
+
+<ul>
+<li><strong>Servicios:</strong> tres desplegables — user-service :8000 (IdP), task-service :8001
+(tareas), billing-service :8002 (facturas). Cada uno, proyecto <code>uv</code> propio.</li>
+<li><strong>Packages:</strong> dos — <code>microservices-observability</code> (capítulo 5) y
+<code>microservices-user-service-client</code> (este capítulo), el segundo dependiendo del
+primero por ruta editable.</li>
+<li><strong>Tests:</strong> 21/21 · 15/16 (el rojo es la migración <code>HTTPBearer</code> en
+curso en <code>deps.py</code>) · 17/17.</li>
+<li><strong>Frontera:</strong> un solo sitio. Los warnings salen del logger
+<code>user-service-client</code> y cada servicio le cuelga el contexto en su
+<code>configure_logging()</code>.</li>
+<li><strong>Pendiente:</strong> cerrar la migración a <code>HTTPBearer</code> en
+<code>task-service/app/deps.py</code> (que dejó un <code>print(token)</code> en la ruta — nunca
+loguear el token crudo), y el capítulo de eventos/outbox para que billing facture desde
+<code>task.completed</code>.</li>
+</ul>
+
+<hr>
+
+<footer>
+<p><em>Nota:</em> la frontera vive en
+<code>packages/microservices-user-service-client/src/demo/microservices/user_service_client/</code>
+y se declara en el <code>pyproject.toml</code> de cada servicio con <code>uv add --editable
+../packages/microservices-user-service-client</code>. La URL del IdP y su timeout se configuran
+por entorno (<code>USER_SERVICE_URL</code>, <code>HTTP_TIMEOUT_SECONDS</code>). Los niveles
+<code>demo/</code> y <code>demo/microservices/</code> del namespace van siempre sin
+<code>__init__.py</code> — en los dos paquetes.</p>
+</footer>
+
+</article>
+
+</body>
+</html>
