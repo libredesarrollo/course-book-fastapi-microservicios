@@ -8,6 +8,7 @@ from demo.microservices.observability import (
     configure_logging,
 )
 from app.db import Base, engine
+from app.routes_jwks import router as jwks_router
 from app.routes_tokens import router as tokens_router
 
 # Sin esto, los INFO (token emitido, revocado) van a ninguna parte: el
@@ -24,10 +25,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="user-service",
-    description="IdP de la serie: tokens opacos que caducan (capítulo 1).",
+    description="IdP de la serie: tokens opacos (capítulo 1) o JWT RS256 (capítulo 10).",
     version="0.1.0",
     lifespan=lifespan,
 )
 app.add_middleware(RequestIdMiddleware)
 app.include_router(tokens_router)
+app.include_router(jwks_router)
 add_health(app, "user-service")

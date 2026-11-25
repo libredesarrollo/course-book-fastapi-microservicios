@@ -9,6 +9,16 @@ def _int(name: str, default: int) -> int:
 TOKEN_TTL_MINUTES = _int("TOKEN_TTL_MINUTES", 60)
 TOKEN_TTL_SECONDS = TOKEN_TTL_MINUTES * 60
 
+# Modo de tokens: "jwt" (stateless, verificación local) u "opaque" (el de siempre).
+# TOKEN_MODE = os.environ.get("TOKEN_MODE", "opaque")
+TOKEN_MODE = os.environ.get("TOKEN_MODE", "jwt")
+
+# JWT RS256: TTL corto porque sin filas no hay revocación (capítulo 10).
+JWT_TTL_MINUTES = _int("JWT_TTL_MINUTES", 15)
+JWT_ISSUER = os.environ.get("JWT_ISSUER", "user-service")
+JWT_PRIVATE_KEY_PATH = os.environ.get("JWT_PRIVATE_KEY_PATH", "jwt_keys/private.pem")
+JWT_PUBLIC_KEY_PATH = os.environ.get("JWT_PUBLIC_KEY_PATH", "jwt_keys/public.pem")
+
 # sqlite de este servicio; en tests, DATABASE_URL=sqlite:///:memory:
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///database.sqlite")
 
