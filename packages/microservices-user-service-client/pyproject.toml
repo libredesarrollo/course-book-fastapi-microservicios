@@ -4,9 +4,11 @@ version = "0.1.0"
 description = "Frontera de red con el IdP: verificación de tokens opacos con traza y errores mapeados (capítulo 6)"
 requires-python = ">=3.13"
 dependencies = [
+    "cryptography>=42",
     "fastapi>=0.115",
     "httpx2>=0.1",
     "microservices-observability",
+    "pyjwt>=2.8",
 ]
 
 [build-system]

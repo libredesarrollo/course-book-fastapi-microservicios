@@ -1,0 +1,6 @@
+{
+  "python.analysis.extraPaths": [
+    "${workspaceFolder}/packages/microservices-observability/src",
+    "${workspaceFolder}/packages/microservices-user-service-client/src"
+  ]
+}

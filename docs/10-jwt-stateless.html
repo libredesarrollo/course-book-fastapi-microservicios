@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>JWT stateless: la clave pública en vez del salto de red</title>
+</head>
+<body>
+
+<article>
+
+<header>
+<h1>JWT stateless: la clave pública en vez del salto de red</h1>
+
+<p><strong>Resumen:</strong> hasta ahora, cada petición a task-service o billing-service
+hacia un <code>GET /api/user</code> al IdP para saber quién era el token. Con el token
+opaco no había otra forma: solo el IdP guardaba la fila. En este capítulo el IdP firma un
+<strong>JWT RS256</strong>, publica su clave pública en <code>/api/jwks.json</code> y los
+relying parties verifican la firma <em>localmente</em>. El resultado medible: con el IdP
+<strong>matado</strong>, una petición autenticada sigue dando <strong>200 en ~2 ms</strong>,
+frente al <strong>503</strong> del capítulo 6.</p>
+
+<p>Lo importante no es solo el JWT: es que este es el <strong>segundo contrato</strong> que
+aprende el paquete <code>microservices-user-service-client</code> sin que ningún servicio
+tenga que enterarse. El capítulo 6 compró un sitio único para la frontera; aquí se cobra.</p>
+
+<p>Referencias de la serie Laravel: <code>laravel/docs/08-que-se-hizo-sso.html</code> y
+<code>laravel/docs/10-jwt-stateless.html</code>.</p>
+</header>
+
+<nav>
+<h2>Contenido</h2>
+<ol>
+<li><a href="#sso">Del 08 al 10: qué se portó y qué no</a></li>
+<li><a href="#idea">La idea: dos formas de responder a la misma pregunta</a></li>
+<li><a href="#uv">Los comandos UV de este capítulo</a></li>
+<li><a href="#idp">El IdP: firmar y publicar</a></li>
+<li><a href="#paquete">El paquete 2: verificar sin red</a></li>
+<li><a href="#contrato">El contrato que no cambia</a></li>
+<li><a href="#tests">Tests</a></li>
+<li><a href="#e2e">E2E: el titular del capítulo</a></li>
+<li><a href="#precios">Los precios del stateless</a></li>
+<li><a href="#estado">Estado actual</a></li>
+</ol>
+</nav>
+
+<hr>
+
+<h2 id="sso">1. Del 08 al 10: qué se portó y qué no</h2>
+
+<p>El capítulo 08 de Laravel resuelve un problema muy concreto: tres aplicaciones con
+formulario de login, cookies y sesiones propias que no se hablan entre sí. Aquí ese
+problema <strong>no existe</strong>: no hay <code>SessionMiddleware</code>, ni cookies, ni
+plantillas, ni tabla <code>users</code> en task-service o billing-service. Ya son relying
+parties puros, y la regla de oro del 08 —la identidad vive solo en el IdP— la cumplimos
+desde el capítulo 1.</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Pieza del 08</th><th>¿En FastAPI?</th><th>Por qué</th></tr>
+<tr><td>Identidad solo en el IdP</td><td>Ya estaba</td><td>Los RPs no tienen usuarios: solo validan tokens</td></tr>
+<tr><td>Ticket SSO con sha256, TTL y un solo uso</td><td>No aporta</td><td>Es el mismo primitivo que ya usa el token opaco (hash + TTL de 60 min)</td></tr>
+<tr><td>Canje <code>/api/sso/exchange</code> por RP</td><td>No</td><td>Con JWT no se guarda token por RP: no hay nada que canjear</td></tr>
+<tr><td>Whitelist de <code>redirect_uri</code></td><td>No</td><td>No hay navegador ni redirects que proteger</td></tr>
+<tr><td><strong>Single logout / revocación</strong></td><td>Sí, como lección</td><td>Hoy <code>DELETE /api/tokens</code> borra la fila y revoca de verdad; con JWT pasa a ser un no-op. Ahí está la parte transferible</td></tr>
+</table>
+
+<div>
+<p><strong>Decisión:</strong> el 08 se <em>cuenta</em>, no se implementa. Portarlo habría
+significado construir sesiones web para desmontarlas en el capítulo siguiente. Lo que sí
+se implementa es el 10, y se hace con el foco puesto en el paquete 2, no en el IdP.</p>
+</div>
+
+<h2 id="idea">2. La idea: dos formas de responder a la misma pregunta</h2>
+
+<p>La pregunta es siempre la misma: <em>¿quién es este token?</em> Y hay dos caminos:</p>
+
+<pre><code>Opaco  ──&gt; GET /api/user al IdP ──&gt; fila en api_tokens ──&gt; {id, name, email}
+JWT    ──&gt; firma RS256 + JWKS cacheada ──&gt; claims ──&gt; {id, name, email}
+                     (sin salto de red por petición)</code></pre>
+
+<p>Los dos caminos conviven. No hay un interruptor global que rompa tokens antiguos: el
+dispatcher decide por la <strong>forma</strong> del token — tres segmentos separados por
+puntos significa JWT; cualquier otra cosa sigue por la carretera del capítulo 2. Así un
+mismo proceso puede atender tokens de los dos modos mientras se migran los clientes.</p>
+
+<p>En el IdP, <code>TOKEN_MODE</code> decide qué se <em>emite</em>:</p>
+
+<pre><code>TOKEN_MODE=opaque   (default) → token de 64 chars, una fila en api_tokens
+TOKEN_MODE=jwt                → JWT de 3 segmentos, CERO filas en api_tokens</code></pre>
+
+<p>El default importa: los 21 tests anteriores siguen pasando sin tocar nada, y eso es lo
+que permite distinguir un rojo nuevo de uno viejo mientras se implementa.</p>
+
+<h2 id="uv">3. Los comandos UV de este capítulo</h2>
+
+<p>Dos dependencias nuevas, <code>pyjwt</code> (firmar/verificar) y <code>cryptography</code>
+(generar RSA y cargar las claves). UV resolvió <code>pyjwt 2.15.1</code> y
+<code>cryptography 50.0.2</code>. Los comandos ejecutados, desde el directorio de cada
+proyecto —no hay workspace—:</p>
+
+<pre><code># 1. IdP: firma RS256 y lectura de claves PEM
+cd user-service
+uv add 'pyjwt&gt;=2.8' 'cryptography&gt;42'
+
+# 2. Paquete 2: el verificador de los RPs
+cd ../packages/microservices-user-service-client
+uv add 'pyjwt&gt;=2.8' 'cryptography&gt;42'
+
+# 3. Generar el par RSA del IdP (una vez; la privada queda 0600)
+cd ../../user-service
+uv run python -m app.jwt_keys
+
+# 4. Tests de los tres proyectos, cada uno desde su directorio
+cd user-service     &amp;&amp; uv run pytest        # 32/32
+cd ../task-service  &amp;&amp; uv run pytest        # 27/27
+cd ../billing-service &amp;&amp; uv run pytest      # 19/19
+
+# 5. Servicios en modo JWT (el IdP con las variables de clave)
+uv run uvicorn app.main:app --port 8000                    # user-service, TOKEN_MODE=jwt
+uv run uvicorn app.main:app --port 8001                    # task-service
+uv run uvicorn app.main:app --port 8002                    # billing-service</code></pre>
+
+<p>El resultado en los <code>pyproject.toml</code> es una línea en <code>dependencies</code>
+por servicio/paquete, y el <code>uv.lock</code> de cada proyecto se actualizó por separado.
+En el paquete 2, <code>uv add</code> añadió además sus dependencias transitivas
+(<code>cffi</code>, <code>pycparser</code>); los servicios que lo consumen en modo editable
+recibieron el paquete actualizado al siguiente <code>uv run</code>, sin <code>uv sync</code>
+manual.</p>
+
+<div>
+<p><strong>Regla del repo:</strong> los comandos <code>uv</code> siempre desde el directorio
+del servicio o del paquete. Un <code>uv run</code> lanzado desde la raíz usa otro entorno y
+hace creer que el cambio "no funcionó".</p>
+</div>
+
+<h2 id="idp">4. El IdP: firmar y publicar</h2>
+
+<h3>4.1. Las claves</h3>
+
+<p><code>uv run python -m app.jwt_keys</code> genera un par RSA de 2048 bits con
+<code>cryptography</code>. La privada se escribe con permisos <code>0600</code> y la pública
+como PEM; el <code>kid</code> se deriva del hash sha256 del material público (16 hex), así
+que la misma clave siempre tiene el mismo identificador. Si el par ya existe, el comando
+se niega a sobrescribirlo: regenerarlo invalidaría todos los JWT vivos.</p>
+
+<pre><code>$ uv run python -m app.jwt_keys
+Par RSA generado. kid=e61a3fe6ab452f38
+Privada: jwt_keys/private.pem (0600) · Pública: jwt_keys/public.pem</code></pre>
+
+<p>Las rutas se configuran con <code>JWT_PRIVATE_KEY_PATH</code> y
+<code>JWT_PUBLIC_KEY_PATH</code>; en el E2E se apuntaron a un directorio temporal para no
+dejar claves en el repo. <code>app/config.py</code> añade, además de <code>TOKEN_MODE</code>,
+<code>JWT_TTL_MINUTES=15</code> y <code>JWT_ISSUER=user-service</code>.</p>
+
+<h3>4.2. El emisor y la JWKS</h3>
+
+<p><code>app/jwt_issuer.py</code> centraliza cuatro operaciones: cargar la privada, cargar
+la pública, derivar el <code>kid</code> y convertir los números de la clave a base64url sin
+padding para la JWK. Los claims del token:</p>
+
+<pre><code>{"iss": "user-service", "sub": "1", "name": "Ana Torres",
+ "email": "ana.torres@example.com", "iat": ..., "exp": ...,
+ "jti": "&lt;32 hex&gt;", "device_name": "api-token"}</code></pre>
+
+<p><code>GET /api/jwks.json</code> es público y responde con una única clave:</p>
+
+<pre><code>{"keys": [{"kty": "RSA", "use": "sig", "alg": "RS256",
+           "kid": "e61a3fe6ab452f38", "n": "...", "e": "AQAB"}]}</code></pre>
+
+<p>Sin claves en disco, tanto el login en modo JWT como el endpoint de JWKS responden
+<strong>503</strong> con el comando para generarlas. Fallo de configuración, no de identidad:
+nunca se disfraza de 401.</p>
+
+<h3>4.3. Emisión, <code>/api/user</code> y revocación</h3>
+
+<p><code>issue_access_token()</code> es la fachada que separa los dos modos: en JWT firma y
+<strong>no toca la BD</strong>; en opaco ejecuta el código de siempre (hash sha256 en
+<code>api_tokens</code>, token crudo una sola vez). La respuesta <code>TokenIssued</code> es
+idéntica en los dos casos, y el rate limit del login sigue colgado de la ruta.</p>
+
+<p><code>app/auth.py</code> aplica el mismo dispatch por forma que el paquete: si el token
+tiene dos puntos, se verifica localmente con la clave pública y se busca al usuario por
+<code>sub</code>; si no, se busca su fila. Por eso el propio IdP acepta su JWT en
+<code>GET /api/user</code> sin llamarse a sí mismo.</p>
+
+<p><code>DELETE /api/tokens</code> valida el token y:</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Modo del token</th><th>Respuesta</th><th>Efecto</th></tr>
+<tr><td>Opaco</td><td>204</td><td>Borra la fila: revocación real e inmediata</td></tr>
+<tr><td>JWT</td><td>204</td><td>No-op: no hay fila; el token sigue vivo hasta <code>exp</code>. Log <code>API token revoke skipped</code></td></tr>
+</table>
+
+<p>El log de emisión cambia de campo: en lugar del nombre del dispositivo lleva
+<code>{"mode": "jwt", "jti": "…"}</code>. El <code>jti</code> permite correlacionar el token
+con el login sin escribir nunca el token crudo en los logs. De paso se quitó un
+<code>"API token issued"</code> espurio que <code>whoami</code> escribía en cada
+<code>GET /api/user</code>.</p>
+
+<h2 id="paquete">5. El paquete 2: verificar sin red</h2>
+
+<p>Tres archivos nuevos en
+<code>packages/microservices-user-service-client/src/demo/microservices/user_service_client/</code>:</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Archivo</th><th>Qué hace</th></tr>
+<tr>
+<td><code>jwks.py</code></td>
+<td><code>JwkKeyStore</code>: baja la JWKS, la cachea en memoria 1 h
+(<code>USER_SERVICE_JWKS_CACHE_TTL</code>), convierte cada JWK a clave RSA con
+<code>RSAAlgorithm.from_jwk</code>, y hace <strong>un solo refetch</strong> si aparece un
+<code>kid</code> desconocido. Un <code>kid</code> forjado no puede martillear el IdP.</td>
+</tr>
+<tr>
+<td><code>jwt_verifier.py</code></td>
+<td><code>verify(token, store)</code>: exige cabecera <code>RS256</code> con <code>kid</code>,
+valida firma, <code>iss=user-service</code>, <code>exp</code> con <code>leeway=10</code> y los
+claims obligatorios. Devuelve el dict de identidad o lanza. Separa identidad inválida de
+JWKS no disponible.</td>
+</tr>
+<tr>
+<td><code>__init__.py</code></td>
+<td><code>verify_token</code> pasa a ser dispatcher: dos puntos → verificación local;
+cualquier otro token → <code>_verify_opaque</code>, que es el código del capítulo 2 sin
+cambiar ni un mensaje de error.</td>
+</tr>
+</table>
+
+<pre><code>def verify_token(token: str) -&gt; dict[str, Any]:
+    if token.count(".") != 2:
+        return _verify_opaque(token)
+    try:
+        return verify_jwt(token, jwks)
+    except JwksUnavailable as exc:
+        # Sin clave pública no se puede verificar: 503, NUNCA 401.
+        ...
+    except (UnknownKid, jwt.PyJWTError, ValueError, TypeError) as exc:
+        # Identidad inválida: 401 SIN llamar al IdP.
+        ...</code></pre>
+
+<p>El store es <strong>uno por proceso</strong>, como el limitador de login del IdP: la JWKS
+se baja una vez y la comparten todas las peticiones que atiende ese worker. Con N réplicas,
+cada una cachea por su lado; el capítulo 9 de resiliencia seguirá teniendo sentido para el
+camino opaco, que no desaparece.</p>
+
+<div>
+<p><strong>El argumento del capítulo 6, cobrado:</strong> ni <code>deps.py</code>, ni
+<code>routes_tasks.py</code>, ni <code>routes_bills.py</code>, ni sus tests de negocio se
+tocaron en este capítulo. Solo cambiaron los <code>pyproject.toml</code> y el paquete. El
+contrato <code>verify_token(token) -&gt; {"id", "name", "email"}</code> es la frontera que
+hace posible eso — el equivalente de <code>IdentityProvider</code> en la serie Laravel.</p>
+</div>
+
+<h2 id="contrato">6. El contrato que no cambia</h2>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Situación</th><th>Resultado</th><th>Camino</th></tr>
+<tr><td>JWT válido</td><td><code>{"id","name","email"}</code></td><td>Local, JWKS cacheada</td></tr>
+<tr><td>JWT con firma rota, expirado, <code>iss</code> ajeno o <code>kid</code> desconocido</td><td><strong>401</strong> sin llamar al IdP</td><td>Local</td></tr>
+<tr><td>JWKS no disponible con caché fría</td><td><strong>503</strong> (<code>No se pudo obtener la JWKS…</code>)</td><td>Local, fallo cerrado</td></tr>
+<tr><td>JWKS no disponible con caché caliente</td><td>Identidad verificada; warning de refresh</td><td>Local, sigue la caché</td></tr>
+<tr><td>Opaco, IdP 401</td><td><strong>401</strong> (<code>Token inválido o expirado</code>)</td><td>HTTP</td></tr>
+<tr><td>Opaco, IdP caído</td><td><strong>503</strong> con el comando para levantarlo</td><td>HTTP</td></tr>
+<tr><td>Opaco, IdP responde otra cosa</td><td><strong>502</strong></td><td>HTTP</td></tr>
+<tr><td>Header malformado</td><td><strong>401</strong> en <code>deps.py</code>, sin red</td><td>Ninguno</td></tr>
+</table>
+
+<p>Además, el paso 0 del capítulo cerró la migración pendiente en
+<code>task-service/app/deps.py</code>: <code>HTTPBearer(auto_error=False)</code> con un 401
+manual (<code>Token no presentado o malformado</code>) y sin el <code>print(token)</code>.
+Antes de escribir código JWT, task-service estaba en 16/16: así cualquier rojo posterior
+sería culpa del capítulo nuevo.</p>
+
+<h2 id="tests">7. Tests</h2>
+
+<p>Herméticos: ningún test levanta un servicio ni necesita el broker. Las claves de los
+tests se generan en memoria con <code>cryptography</code> o en <code>tmp_path</code>, nunca
+del repo. La JWKS se stubbea reemplazando <code>_http_get</code> del módulo
+<code>jwks</code>; el camino opaco se stubbea reemplazando <code>_http_get</code> del
+paquete, como en el capítulo 6.</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Suite</th><th>Antes</th><th>Ahora</th><th>Nuevo cubre</th></tr>
+<tr><td>user-service</td><td>21</td><td><strong>32</strong></td><td>Generación de claves y permisos, JWKS, emisión JWT sin filas, claims y TTL, firma rota, exp, issuer ajeno, revoke no-op, log con <code>jti</code> sin token, rate limit en modo JWT</td></tr>
+<tr><td>task-service</td><td>16</td><td><strong>27</strong></td><td>Verificador: válido sin red, una sola bajada de JWKS, firma ajena, expirado, claims ausentes, cabecera sin <code>kid</code> o con HS256, <code>kid</code> desconocido con un solo refetch, JWKS caída/malformada, caché caliente, opaco intacto</td></tr>
+<tr><td>billing-service</td><td>17</td><td><strong>19</strong></td><td>Dos tests de humo: el <em>mismo paquete</em> verifica JWT en el segundo consumidor y el dueño sale del <code>sub</code>; JWT roto → 401 sin HTTP</td></tr>
+</table>
+
+<pre><code>$ cd user-service     &amp;&amp; uv run pytest -q
+................................                                     [100%]
+$ cd ../task-service  &amp;&amp; uv run pytest -q
+...........................                                          [100%]
+$ cd ../billing-service &amp;&amp; uv run pytest -q
+...................                                                  [100%]</code></pre>
+
+<h2 id="e2e">8. E2E: el titular del capítulo</h2>
+
+<p>Con el IdP en <code>TOKEN_MODE=jwt</code> (en el puerto 8003 para no estorbar los
+procesos ya en marcha), billing en el 8006 y task en el 8001, todos apuntando al IdP por
+<code>USER_SERVICE_URL</code>:</p>
+
+<pre><code>$ curl -s http://127.0.0.1:8003/api/jwks.json
+{"keys":[{"kty":"RSA","use":"sig","alg":"RS256",
+          "kid":"e61a3fe6ab452f38","n":"...","e":"AQAB"}]}
+
+$ curl -s -X POST http://127.0.0.1:8003/api/tokens -H "Content-Type: application/json" \
+    -d '{"email":"ana.torres@example.com","password":"password"}'
+→ 201, token de 662 chars con 3 segmentos
+
+filas en api_tokens ANTES del login: 25
+filas en api_tokens DESPUÉS del login: 25        # cero escrituras
+
+$ curl -s -X POST http://127.0.0.1:8006/api/bills -H "Authorization: Bearer $TOKEN" ...
+→ 201 {"id":2,"user_id":1,"task_title":"Informe JWT",...}
+$ curl -s -X POST http://127.0.0.1:8001/api/tasks -H "Authorization: Bearer $TOKEN" ...
+→ 201 {"id":5,"user_id":1,"title":"Tarea JWT",...}
+
+$ for i in 1 2 3; do curl -w "%{time_total}" .../api/bills -H "Authorization: Bearer $TOKEN"; done
+0.002358s · 200     0.001514s · 200     0.001456s · 200</code></pre>
+
+<p>Y entonces se mata el IdP:</p>
+
+<pre><code>$ lsof -t -iTCP:8003 -sTCP:LISTEN | xargs kill
+
+$ curl -w "%{http_code} en %{time_total}s" http://127.0.0.1:8006/api/bills \
+    -H "Authorization: Bearer $TOKEN"
+200 en 0.001713s
+
+$ curl -w "%{http_code} en %{time_total}s" http://127.0.0.1:8001/api/tasks \
+    -H "Authorization: Bearer $TOKEN"
+200 en 0.002430s</code></pre>
+
+<p>Comparación directa con el capítulo 6: con token opaco, ese mismo escenario devolvía
+<strong>503</strong> y el comando para levantar el servicio. Con JWT cacheado, <strong>200
+en ~2 ms</strong>. Los logs lo confirman: billing bajó la JWKS una vez, task otra, y no
+hubo ni un <code>GET /api/user</code> en los RPs.</p>
+
+<p>Los otros dos casos límite, también en vivo:</p>
+
+<pre><code># Caché fría + IdP caído (billing recién reiniciado) → fallo cerrado
+503 {"detail":"No se pudo obtener la JWKS del user-service; ..."}
+WARNING:user-service-client:JWKS unavailable {"url":"http://127.0.0.1:8003/api/jwks.json",
+         "error":"[Errno 61] Connection refused"} request_id=fb414084-bea7-4c96-8e2c-c8b55cedadde
+
+# Modo opaco, IdP arriba y luego caído → compatibilidad intacta
+token de 64 chars → GET /api/bills 200 en 0.034857s
+DELETE /api/tokens 204 → GET /api/bills 401 (revocación real)
+IdP caído → 503 con el comando para levantarlo
+
+# DELETE en modo JWT
+204 → el JWT sigue dando 200 en /api/user; api_tokens sigue en 25 filas</code></pre>
+
+<h2 id="precios">9. Los precios del stateless</h2>
+
+<ul>
+<li><strong>Revocación:</strong> sin filas no hay invalidación antes de <code>exp</code>.
+TTL de 15 minutos y <code>DELETE</code> no-op. Una denylist por <code>jti</code> la haría
+stateful otra vez: se decidió no pagar ese precio y decirlo claro.</li>
+<li><strong>Arranque en frío:</strong> JWKS sin caché + IdP caído = imposible de verificar.
+Se falla cerrado con 503; jamás se degrada a 401, porque un 401 sugeriría que el cliente
+tiene la culpa.</li>
+<li><strong>La traza cambia de camino:</strong> en modo JWT no hay <code>GET /api/user</code>,
+así que <code>X-Request-Id</code> <em>ya no cruza al IdP</em>. El <code>ContextVar</code> sigue
+dando contexto a los logs locales (el warning de JWKS caída lleva su
+<code>request_id</code>), pero la petición de autenticación no sale del RP. Es una
+consecuencia de eliminar el salto de red, no una regresión.</li>
+<li><strong>Rotación:</strong> regenerar el par invalida todos los JWT vivos. Los RPs
+refetch solos al ver otro <code>kid</code>; un <code>kid</code> desconocido que no aparece
+se rechaza sin repetir la descarga.</li>
+<li><strong>Seguridad:</strong> RS256, nunca HS256 — con una clave simétrica cualquier RP
+podría fabricar tokens. <code>iss</code> explícito, <code>leeway</code> de 10 s, <code>jti</code>
+para correlacionar sin exponer el token, y privada con permisos <code>0600</code> fuera del
+repo.</li>
+</ul>
+
+<h2 id="estado">10. Estado actual</h2>
+
+<ul>
+<li><strong>Tres servicios</strong> con proyecto <code>uv</code> propio y <strong>dos
+paquetes</strong> editables: observabilidad y cliente del IdP (este último depende del
+primero y ahora sabe verificar JWT y opacos).</li>
+<li><strong>Suites:</strong> 32/32 · 27/27 · 19/19.</li>
+<li><strong>Modos:</strong> <code>TOKEN_MODE=opaque</code> por defecto; <code>jwt</code>
+activable por entorno sin tocar código. Los RPs no saben (ni necesitan saber) en qué modo
+está el IdP.</li>
+<li><strong>Pendientes:</strong> el capítulo 09 de resiliencia (reintentos y circuit breaker
+para el camino opaco que queda), el capítulo de eventos/outbox para que billing facture
+desde <code>task.completed</code>, y el <code>log.info("Failed login attempt …")</code>
+espurio en <code>task-service/app/routes_tasks.py</code>, que apareció otra vez en los logs
+del E2E y sigue sin tocarse a la espera de confirmación.</li>
+</ul>
+
+<hr>
+
+<footer>
+<p><em>Nota:</em> las claves se generan con <code>uv run python -m app.jwt_keys</code> desde
+<code>user-service/</code> (rutas por <code>JWT_PRIVATE_KEY_PATH</code> /
+<code>JWT_PUBLIC_KEY_PATH</code>). Las dependencias se añadieron con
+<code>uv add 'pyjwt&gt;=2.8' 'cryptography&gt;42'</code> en <code>user-service/</code> y en
+<code>packages/microservices-user-service-client/</code>. La JWKS se configura con
+<code>USER_SERVICE_JWKS_CACHE_TTL</code> (3600 s por defecto) y el verificador lee
+<code>JWT_ISSUER</code> (default <code>user-service</code>), el mismo valor que el IdP firma.</p>
+</footer>
+
+</article>
+
+</body>
+</html>

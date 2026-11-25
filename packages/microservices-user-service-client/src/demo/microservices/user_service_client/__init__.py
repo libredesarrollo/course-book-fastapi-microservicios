@@ -1,4 +1,4 @@
-"""La frontera de red con el user-service, en un solo sitio (capítulo 6).
+"""La frontera con el user-service, en un solo sitio (capítulos 6 y 10).
 
 Paquete interno de la serie, consumido por task-service y billing-service.
 Es el segundo paquete: nació cuando el tercer microservicio (billing)
@@ -8,20 +8,20 @@ en dos sitios — la divergencia solo era cuestión de tiempo.
 El contrato que fija la serie:
 
 - `verify_token(token)` devuelve el dict de identidad `{"id", "name", "email"}`
-  o lanza `HTTPException` ya mapeada: `401` si el IdP rechazó el token
-  (identidad inválida, no fallo nuestro), `503` si el IdP no está en pie
-  (fallo de infraestructura, con el comando para levantarlo), `502` si
-  responde algo inesperado.
-- Propaga el correlation ID: lee el mismo `ContextVar` que fija
-  `RequestIdMiddleware` (del paquete microservices-observability) y manda
-  `X-Request-Id` en cada llamada. Dos contextvars separados romperían la
-  traza en silencio.
-- Los warnings de la frontera salen por el logger `LOGGER_NAME`
-  ("user-service-client"); cada servicio lo pasa a `configure_logging()`
-  para que las líneas lleven el request_id.
+  o lanza `HTTPException` ya mapeada: `401` si la identidad no es válida,
+  `503` si falta infraestructura, `502` si el IdP responde algo inesperado.
+  Los RPs no saben si el token era JWT u opaco: se decide por su forma.
+- JWT (tres segmentos separados por puntos): firma RS256 verificada con la
+  JWKS cacheada, sin salto de red por petición. Sin caché y con el IdP caído
+  no se puede verificar: fallo cerrado con 503.
+- Opaco: `GET /api/user` al IdP, propagando el correlation ID del mismo
+  `ContextVar` que fija `RequestIdMiddleware` (paquete observabilidad).
+  En modo JWT esa cabecera ya no cruza: no hay petición por token.
+- Los warnings salen por el logger `LOGGER_NAME` ("user-service-client");
+  cada servicio lo pasa a `configure_logging()` para que lleven request_id.
 
-La configuración es por entorno (12-factor): `USER_SERVICE_URL` y
-`HTTP_TIMEOUT_SECONDS`, con los mismos defaults que usaban los servicios.
+Configuración por entorno: `USER_SERVICE_URL`, `HTTP_TIMEOUT_SECONDS` y
+`USER_SERVICE_JWKS_CACHE_TTL`.
 """
 
 import json
@@ -31,8 +31,12 @@ from typing import Any
 
 from fastapi import HTTPException
 import httpx2
+import jwt
 
 from demo.microservices.observability import REQUEST_ID_HEADER, request_id
+
+from .jwks import JwkKeyStore, JwksUnavailable, UnknownKid
+from .jwt_verifier import verify as verify_jwt
 
 LOGGER_NAME = "user-service-client"
 
@@ -45,6 +49,10 @@ def _env_int(name: str, default: int) -> int:
 
 USER_SERVICE_URL = os.environ.get("USER_SERVICE_URL", "http://127.0.0.1:8000")
 HTTP_TIMEOUT_SECONDS = _env_int("HTTP_TIMEOUT_SECONDS", 2)
+
+# Un store por proceso, igual que el rate limit del IdP: la JWKS se baja una
+# vez y se comparte entre todas las peticiones que atiende este worker.
+jwks = JwkKeyStore(f"{USER_SERVICE_URL}/api/jwks.json", HTTP_TIMEOUT_SECONDS)
 
 
 def _http_get(url: str, headers: dict[str, str]) -> httpx2.Response:
@@ -59,9 +67,8 @@ def _trace_headers() -> dict[str, str]:
     return {REQUEST_ID_HEADER: rid} if rid else {}
 
 
-def verify_token(token: str) -> dict[str, Any]:
-    """¿Quién es este token? Toda la frontera de red vive en este paquete:
-    los demás módulos te mandan el dict del usuario como si fuera local."""
+def _verify_opaque(token: str) -> dict[str, Any]:
+    """El camino del capítulo 2: preguntar al IdP por el token opaco."""
     try:
         resp = _http_get(
             f"{USER_SERVICE_URL}/api/user",
@@ -107,3 +114,32 @@ def verify_token(token: str) -> dict[str, Any]:
         status_code=502,
         detail=f"Respuesta inesperada del user-service (HTTP {resp.status_code})",
     )
+
+
+def verify_token(token: str) -> dict[str, Any]:
+    """¿Quién es este token? Un JWT se verifica aquí; un opaco va al IdP.
+
+    Lo que no cambia es el contrato: los RPs siguen recibiendo el dict de
+    identidad y las mismas HTTPException de siempre.
+    """
+    if token.count(".") != 2:
+        return _verify_opaque(token)
+
+    try:
+        return verify_jwt(token, jwks)
+    except JwksUnavailable as exc:
+        # Sin clave pública no hay verificación posible: es infraestructura,
+        # no una identidad inválida. Nunca se degrada a 401.
+        log.warning(
+            "JWKS unavailable %s",
+            json.dumps({"url": jwks.url, "error": str(exc)}, ensure_ascii=False),
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="No se pudo obtener la JWKS del user-service; sin clave pública no se puede verificar el token",
+        ) from exc
+    except (UnknownKid, jwt.PyJWTError, ValueError, TypeError) as exc:
+        # Firma rota, exp, iss ajeno, kid desconocido...: identidad inválida,
+        # y por tanto 401 SIN llamar al IdP.
+        log.warning("JWT rejected locally")
+        raise HTTPException(status_code=401, detail="Token inválido o expirado") from exc
